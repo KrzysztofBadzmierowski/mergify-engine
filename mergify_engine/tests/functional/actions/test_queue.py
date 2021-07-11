@@ -24,6 +24,7 @@ import yaml
 from mergify_engine import config
 from mergify_engine import constants
 from mergify_engine import context
+from mergify_engine import date
 from mergify_engine import github_types
 from mergify_engine import queue
 from mergify_engine import rules
@@ -181,16 +182,143 @@ class TestQueueAction(base.FunctionalTestBase):
         p1 = await self.get_pull(p1["number"])
         assert p1["head"]["sha"] != head_sha  # ensure it have been rebased
 
-        check = first(
-            await context.Context(self.repository_ctxt, p1).pull_engine_check_runs,
-            key=lambda c: c["name"] == "Rule: Merge priority high (queue)",
-        )
-        assert (
-            check["output"]["title"]
-            == "The pull request is the 1st in the queue to be merged"
-        )
+        async def assert_queued():
+            check = first(
+                await context.Context(self.repository_ctxt, p1).pull_engine_check_runs,
+                key=lambda c: c["name"] == "Rule: Merge priority high (queue)",
+            )
+            assert (
+                check["output"]["title"]
+                == "The pull request is the 1st in the queue to be merged"
+            )
+
+        await assert_queued()
+
+        await self.create_comment(p1["number"], "@mergifyio refresh")
+        await self.run_engine()
+        await assert_queued()
+
+        await self.create_status(p1, state="pending")
+        await self.run_engine()
+        await assert_queued()
 
         await self.create_status(p1)
+        await self.run_engine()
+
+        pulls = await self.get_pulls()
+        assert len(pulls) == 0
+
+        await self._assert_cars_contents(q, [])
+
+    async def test_queue_with_labels(self):
+        rules = {
+            "queue_rules": [
+                {
+                    "name": "default",
+                    "conditions": [
+                        "status-success=continuous-integration/fake-ci",
+                        "label=foobar",
+                    ],
+                    "speculative_checks": 5,
+                }
+            ],
+            "pull_request_rules": [
+                {
+                    "name": "Merge priority high",
+                    "conditions": [
+                        f"base={self.master_branch_name}",
+                        "label=queue",
+                    ],
+                    "actions": {"queue": {"name": "default", "priority": "high"}},
+                },
+            ],
+        }
+        await self.setup_repo(yaml.dump(rules))
+
+        p1, _ = await self.create_pr()
+        p2, _ = await self.create_pr()
+
+        # To force others to be rebased
+        p, _ = await self.create_pr()
+        await self.merge_pull(p["number"])
+        await self.wait_for("pull_request", {"action": "closed"})
+        await self.run_engine()
+        p = await self.get_pull(p["number"])
+
+        await self.add_label(p1["number"], "queue")
+        await self.add_label(p2["number"], "queue")
+        await self.run_engine()
+
+        pulls = await self.get_pulls()
+        assert len(pulls) == 3
+
+        tmp_pull = await self.get_pull(pulls[0]["number"])
+        assert tmp_pull["number"] not in [p1["number"], p2["number"]]
+
+        ctxt = context.Context(self.repository_ctxt, p)
+        q = await merge_train.Train.from_context(ctxt)
+
+        await self._assert_cars_contents(
+            q,
+            [
+                TrainCarMatcher(
+                    p1["number"],
+                    [],
+                    p["merge_commit_sha"],
+                    p["merge_commit_sha"],
+                    "updated",
+                    None,
+                ),
+                TrainCarMatcher(
+                    p2["number"],
+                    [p1["number"]],
+                    p["merge_commit_sha"],
+                    p["merge_commit_sha"],
+                    "created",
+                    tmp_pull["number"],
+                ),
+            ],
+        )
+
+        assert tmp_pull["commits"] == 4
+        await self.create_status(tmp_pull)
+
+        head_sha = p1["head"]["sha"]
+        p1 = await self.get_pull(p1["number"])
+        assert p1["head"]["sha"] != head_sha  # ensure it have been rebased
+
+        async def assert_queued(pull):
+            check = first(
+                await context.Context(
+                    self.repository_ctxt, pull
+                ).pull_engine_check_runs,
+                key=lambda c: c["name"] == constants.MERGE_QUEUE_SUMMARY_NAME,
+            )
+            assert check["conclusion"] is None
+
+        await assert_queued(p1)
+        await assert_queued(p2)
+
+        await self.create_status(p1, state="pending")
+        await self.create_status(p2, state="pending")
+        await self.run_engine()
+        await assert_queued(p1)
+        await assert_queued(p2)
+
+        pulls = await self.get_pulls()
+        assert len(pulls) == 3
+
+        await self.create_status(p1)
+        await self.create_status(p2)
+        await self.run_engine()
+        await assert_queued(p1)
+        await assert_queued(p2)
+
+        pulls = await self.get_pulls()
+        assert len(pulls) == 3
+
+        await self.add_label(p1["number"], "foobar")
+        await self.add_label(p2["number"], "foobar")
         await self.run_engine()
 
         pulls = await self.get_pulls()
@@ -957,7 +1085,8 @@ class TestQueueAction(base.FunctionalTestBase):
 
         # click on refresh btn
         await self.installation_ctxt.client.post(
-            f"{self.repository_ctxt.base_url}/check-suites/{check_suite_id}/rerequest"
+            f"{self.repository_ctxt.base_url}/check-suites/{check_suite_id}/rerequest",
+            api_version="antiope",
         )
         await self.wait_for("check_suite", {"action": "rerequested"})
         await self.run_engine()
@@ -1335,6 +1464,12 @@ class TestQueueAction(base.FunctionalTestBase):
         p1 = await self.get_pull(p1["number"])
         assert p1["merged"]
 
+    # FIXME(sileht): Provide a tools to generate oauth_token without
+    # the need of the dashboard
+    @pytest.mark.skipif(
+        config.GITHUB_URL != "https://github.com",
+        reason="We use a PAT token instead of an OAUTH_TOKEN",
+    )
     async def test_pull_have_base_branch_merged_commit_with_changed_workflow(self):
         rules = {
             "queue_rules": [
@@ -1445,6 +1580,170 @@ class TestQueueAction(base.FunctionalTestBase):
 
         await self._assert_cars_contents(q, [])
 
+    async def test_more_ci_in_pull_request_rules_succeed(self):
+        rules = {
+            "queue_rules": [
+                {
+                    "name": "default",
+                    "conditions": [
+                        "status-success=continuous-integration/fake-ci",
+                    ],
+                    "speculative_checks": 5,
+                }
+            ],
+            "pull_request_rules": [
+                {
+                    "name": "Merge priority high",
+                    "conditions": [
+                        f"base={self.master_branch_name}",
+                        "status-success=continuous-integration/fake-ci",
+                        "status-success=very-long-ci",
+                        "label=queue",
+                    ],
+                    "actions": {"queue": {"name": "default", "priority": "high"}},
+                },
+            ],
+        }
+        await self.setup_repo(yaml.dump(rules))
+
+        p1, _ = await self.create_pr()
+
+        # To force others to be rebased
+        p, _ = await self.create_pr()
+        await self.merge_pull(p["number"])
+        await self.wait_for("pull_request", {"action": "closed"})
+        await self.run_engine()
+        p = await self.get_pull(p["number"])
+
+        await self.add_label(p1["number"], "queue")
+        await self.create_status(p1)
+        await self.create_status(p1, context="very-long-ci")
+        await self.run_engine()
+        await self.wait_for("pull_request", {"action": "synchronize"})
+        await self.run_engine()
+
+        ctxt = context.Context(self.repository_ctxt, p)
+        q = await merge_train.Train.from_context(ctxt)
+
+        await self._assert_cars_contents(
+            q,
+            [
+                TrainCarMatcher(
+                    p1["number"],
+                    [],
+                    p["merge_commit_sha"],
+                    p["merge_commit_sha"],
+                    "updated",
+                    None,
+                ),
+            ],
+        )
+
+        head_sha = p1["head"]["sha"]
+        p1 = await self.get_pull(p1["number"])
+        assert p1["head"]["sha"] != head_sha  # ensure it have been rebased
+
+        check = first(
+            await context.Context(self.repository_ctxt, p1).pull_engine_check_runs,
+            key=lambda c: c["name"] == "Rule: Merge priority high (queue)",
+        )
+        assert (
+            check["output"]["title"]
+            == "The pull request is the 1st in the queue to be merged"
+        )
+
+        await self.create_status(p1)
+        await self.run_engine()
+
+        await self.wait_for("push", {"ref": f"refs/heads/{self.master_branch_name}"})
+
+        pulls = await self.get_pulls()
+        assert len(pulls) == 0
+
+        await self._assert_cars_contents(q, [])
+
+    async def test_more_ci_in_pull_request_rules_failure(self):
+        rules = {
+            "queue_rules": [
+                {
+                    "name": "default",
+                    "conditions": [
+                        "status-success=continuous-integration/fake-ci",
+                    ],
+                    "speculative_checks": 5,
+                }
+            ],
+            "pull_request_rules": [
+                {
+                    "name": "Merge priority high",
+                    "conditions": [
+                        f"base={self.master_branch_name}",
+                        "status-success=continuous-integration/fake-ci",
+                        "status-success=very-long-ci",
+                        "label=queue",
+                    ],
+                    "actions": {"queue": {"name": "default", "priority": "high"}},
+                },
+            ],
+        }
+        await self.setup_repo(yaml.dump(rules))
+
+        p1, _ = await self.create_pr()
+
+        # To force others to be rebased
+        p, _ = await self.create_pr()
+        await self.merge_pull(p["number"])
+        await self.wait_for("pull_request", {"action": "closed"})
+        await self.run_engine()
+        p = await self.get_pull(p["number"])
+
+        await self.add_label(p1["number"], "queue")
+        await self.create_status(p1)
+        await self.create_status(p1, context="very-long-ci")
+        await self.run_engine()
+        await self.wait_for("pull_request", {"action": "synchronize"})
+        await self.run_engine()
+
+        ctxt = context.Context(self.repository_ctxt, p)
+        q = await merge_train.Train.from_context(ctxt)
+
+        await self._assert_cars_contents(
+            q,
+            [
+                TrainCarMatcher(
+                    p1["number"],
+                    [],
+                    p["merge_commit_sha"],
+                    p["merge_commit_sha"],
+                    "updated",
+                    None,
+                ),
+            ],
+        )
+
+        head_sha = p1["head"]["sha"]
+        p1 = await self.get_pull(p1["number"])
+        assert p1["head"]["sha"] != head_sha  # ensure it have been rebased
+
+        await self.run_engine()
+        check = first(
+            await context.Context(self.repository_ctxt, p1).pull_engine_check_runs,
+            key=lambda c: c["name"] == "Rule: Merge priority high (queue)",
+        )
+        assert (
+            check["output"]["title"]
+            == "The pull request is the 1st in the queue to be merged"
+        )
+
+        await self.remove_label(p1["number"], "queue")
+        await self.run_engine()
+
+        # not merged and unqueued
+        pulls = await self.get_pulls()
+        assert len(pulls) == 1
+
+        await self._assert_cars_contents(q, [])
+
 
 class TestTrainApiCalls(base.FunctionalTestBase):
     SUBSCRIPTION_ACTIVE = True
@@ -1477,13 +1776,19 @@ class TestTrainApiCalls(base.FunctionalTestBase):
             config,
             head_sha,
             head_sha,
+            date.utcnow(),
         )
         await car.create_pull(
-            rules.QueueRule(name="foo", conditions=[], config=queue_config)
+            rules.QueueRule(
+                name="foo", conditions=rules.RuleConditions([]), config=queue_config
+            )
         )
         assert car.queue_pull_request_number is not None
         pulls = await self.get_pulls()
         assert len(pulls) == 3
+
+        tmp_pull = [p for p in pulls if p["number"] == car.queue_pull_request_number][0]
+        assert tmp_pull["draft"]
 
         await car.delete_pull()
 
@@ -1526,10 +1831,13 @@ class TestTrainApiCalls(base.FunctionalTestBase):
             config,
             head_sha,
             head_sha,
+            date.utcnow(),
         )
         with pytest.raises(merge_train.TrainCarPullRequestCreationFailure) as exc_info:
             await car.create_pull(
-                rules.QueueRule(name="foo", conditions=[], config=queue_config)
+                rules.QueueRule(
+                    name="foo", conditions=rules.RuleConditions([]), config=queue_config
+                )
             )
             assert exc_info.value.car == car
             assert car.queue_pull_request_number is None

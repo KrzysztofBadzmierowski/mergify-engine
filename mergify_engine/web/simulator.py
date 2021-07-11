@@ -1,6 +1,6 @@
 # -*- encoding: utf-8 -*-
 #
-# Copyright © 2020 Mergify SAS
+# Copyright © 2020–2021 Mergify SAS
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -13,8 +13,8 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
-
 import json
+import typing
 from urllib.parse import urlsplit
 
 import fastapi
@@ -25,6 +25,7 @@ import voluptuous
 
 from mergify_engine import context
 from mergify_engine import exceptions
+from mergify_engine import github_types
 from mergify_engine import rules
 from mergify_engine import subscription
 from mergify_engine import utils
@@ -56,18 +57,32 @@ def PullRequestUrl(v):
     return owner, repo, pull_number
 
 
+def SimulatorMergifyConfig(v: bytes) -> rules.MergifyConfig:
+    try:
+        return rules.get_mergify_config(
+            context.MergifyConfigFile(
+                {
+                    "type": "file",
+                    "content": "whatever",
+                    "sha": github_types.SHAType("whatever"),
+                    "path": ".mergify.yml",
+                    "decoded_content": v,
+                }
+            )
+        )
+    except rules.InvalidRules as e:
+        raise e.error
+
+
 SimulatorSchema = voluptuous.Schema(
     {
         voluptuous.Required("pull_request"): voluptuous.Any(None, PullRequestUrl()),
-        voluptuous.Required("mergify.yml"): voluptuous.And(
-            voluptuous.Coerce(rules.YAML),
-            rules.UserConfigurationSchema,
-        ),
+        voluptuous.Required("mergify.yml"): voluptuous.Coerce(SimulatorMergifyConfig),
     }
 )
 
 
-def voluptuous_error(error):
+def voluptuous_error(error: voluptuous.Invalid) -> str:
     if error.path:
         if error.path[0] == "mergify.yml":
             error.path.pop(0)
@@ -86,8 +101,20 @@ async def voluptuous_errors(
     return responses.JSONResponse(status_code=400, content=payload)
 
 
-async def _simulator(redis_cache, pull_request_rules, owner, repo, pull_number, token):
+async def _simulator(
+    redis_cache: utils.RedisCache,
+    pull_request_rules: rules.PullRequestRules,
+    owner: github_types.GitHubLogin,
+    repo: str,
+    pull_number: int,
+    token: str,
+) -> typing.Tuple[str, str]:
     try:
+        auth: typing.Union[
+            github.GithubAppInstallationAuth,
+            github.GithubActionAccessTokenAuth,
+            github.GithubTokenAuth,
+        ]
         if token:
             auth = github.GithubTokenAuth(token)
         else:
@@ -112,11 +139,9 @@ async def _simulator(redis_cache, pull_request_rules, owner, repo, pull_number, 
                 client,
                 redis_cache,
             )
-            repository = context.Repository(
-                installation, repo, data["base"]["repo"]["id"]
-            )
+            repository = context.Repository(installation, data["base"]["repo"])
             ctxt = await repository.get_pull_request_context(data["number"], data)
-            ctxt.sources = [{"event_type": "mergify-simulator", "data": []}]
+            ctxt.sources = [{"event_type": "mergify-simulator", "data": [], "timestamp": ""}]  # type: ignore[typeddict-item]
             match = await pull_request_rules.get_pull_request_rule(ctxt)
             return await actions_runner.gen_summary(ctxt, pull_request_rules, match)
     except exceptions.MergifyNotInstalled:
@@ -153,19 +178,12 @@ async def simulator(
             token=token,
         )
     else:
-        title, summary = ("The configuration is valid", None)
+        title, summary = ("The configuration is valid", "")
 
-    pull_request_rules_conditions = [
-        [cond.tree for cond in rule.conditions]
-        for rule in data["mergify.yml"]["pull_request_rules"]
-    ]
     return responses.JSONResponse(
         status_code=200,
         content={
             "title": title,
             "summary": summary,
-            "conditions": {
-                "pull_request_rules": pull_request_rules_conditions,
-            },
         },
     )

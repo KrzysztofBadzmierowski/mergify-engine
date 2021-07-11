@@ -1,13 +1,20 @@
 $(function() {
-  // WHY?
-  $("body").fadeIn(0)
-
   // The default href for the current navbar on load is # which does not match the first h1 title and breaks scrollspy
-   $("li.toctree-l1.current > a[href='#']").attr("href", $(".section > h1 > a").attr('href'));
+  $("li.toctree-l1.current > a[href='#']").attr("href", $(".section > h1 > a").attr('href'));
+  $("li.toctree-l1.current > a[href='#']").attr("href", $("section > h1 > a").attr('href'));
 
-  $('body').scrollspy({ target: 'div.sphinxsidebar', offset: 48 })
+  // This is a bit tricky: scrollspy wants precisely a list where all anchors
+  // are starting with "#" so we need to select precisely in the navbar where
+  // this is. This depends on which type of page we are in: a top level page,
+  // or a page that is split in sub-pages.
+  // If it's a subsection/subpage, then there's no scroll to do, so disable it.
+  var selector = 'div.sphinxsidebar > ul.current > li.current > ul.current > li.current';
 
-  // Change class from current to active for navball pills
+  if ($(selector).length == 0) {
+    $('body').scrollspy({ target: 'div.sphinxsidebar > ul.current > li.current', offset: 10 });
+  }
+
+  // Change class from current to active for navbar pills
   $("div.sphinxsidebar a.reference.current").removeClass("current").addClass("active")
 
   // Grid layout Style
@@ -21,15 +28,15 @@ $(function() {
   // Tables
   $("table.docutils").addClass("table table-striped").removeClass("docutils")
     .find("thead")
-    .addClass("thead-dark")
+    .addClass("table-dark")
 
   // Admonition
   $(".admonition").addClass("alert").removeClass("admonition")
-    .filter(".hint").removeClass("hint").addClass("alert-info").children('p.admonition-title').prepend('<div class="icon"></div>').end().end()
-    .filter(".note").removeClass("note").addClass("alert-primary").children('p.admonition-title').prepend('<div class="icon"></div>').end().end()
-    .filter(".warning").removeClass("warning").addClass("alert-warning").children('p.admonition-title').prepend('<div class="icon"></div>').end().end()
-    .filter(".tip").removeClass("tip").addClass("alert-info").children('p.admonition-title').prepend('<div class="icon"></div>').end().end()
-    .filter(".important").removeClass("important").addClass("alert-primary").children('p.admonition-title').prepend('<div class="icon"></div>').end().end()
+    .filter(".hint").removeClass("hint").addClass("alert-info").children('p.admonition-title').prepend('ℹ️ ').end().end()
+    .filter(".note").removeClass("note").addClass("alert-primary").children('p.admonition-title').prepend('📝 ').end().end()
+    .filter(".warning").removeClass("warning").addClass("alert-warning").children('p.admonition-title').prepend('⚠️ ').end().end()
+    .filter(".tip").removeClass("tip").addClass("alert-info").children('p.admonition-title').prepend('👍 ').end().end()
+    .filter(".important").removeClass("important").addClass("alert-danger").children('p.admonition-title').prepend('🛑 ').end().end()
 
   // images
   $(".documentwrapper img").addClass("img-fluid");
@@ -40,9 +47,6 @@ $(function() {
   $("div.topic > ul").addClass("list-group");
   $("div.topic > ul > li").addClass("list-group-item").addClass("flex-fill").addClass("list-group-item-action");
   $("div.topic").removeClass("topic");
-
-  // Replace permalink unicode emoji by Font Awesome
-  $("a.headerlink").html(" <i class=\"fas fa-link\"></i>");
 
   // Remove the toctree on the frontpage
   // Hiding it is not enough
@@ -57,18 +61,11 @@ $(function() {
       }
     }
   );
+
+  // Twemoji
+  twemoji.parse(document, {
+    folder: 'svg',
+    ext: '.svg'
+  });
 });
 
-
-// Scroll to the anchor
-// why is this needed? lol chrome? :(
-$(document).ready(function () {
-  var isChrome = /Chrome/.test(navigator.userAgent) && /Google Inc/.test(navigator.vendor);
-  if (window.location.hash && isChrome) {
-    setTimeout(function () {
-      var hash = window.location.hash;
-      window.location.hash = "";
-      window.location.hash = hash;
-    }, 300);
-  }
-});

@@ -43,6 +43,9 @@ class TestSimulator(base.FunctionalTestBase):
   - name: assign
     conditions:
       - base={self.master_branch_name}
+      - or:
+        - schedule=MON-SUN 00:00-23:59
+        - label=foobar
     actions:
       assign:
         users:
@@ -59,7 +62,7 @@ class TestSimulator(base.FunctionalTestBase):
         )
         assert r.status_code == 200, r.json()
         assert r.json()["title"] == "The configuration is valid"
-        assert r.json()["summary"] is None
+        assert r.json()["summary"] == ""
 
         r = await self.app.post(
             "/simulator/",
@@ -72,8 +75,8 @@ class TestSimulator(base.FunctionalTestBase):
 
         assert r.json()["title"] == "1 rule matches"
         assert r.json()["summary"].startswith(
-            f"#### Rule: assign (assign)\n- [X] `base={self.master_branch_name}`\n\n<hr />"
-        )
+            f"### Rule: assign (assign)\n- [X] `base={self.master_branch_name}`\n- [X] any of:\n  - [X] `schedule=MON-SUN 00:00-23:59`\n  - [ ] `label=foobar`\n\n<hr />"
+        ), r.json()["summary"]
 
         mergify_yaml = """pull_request_rules:
   - name: remove label conflict
@@ -122,7 +125,7 @@ class TestSimulator(base.FunctionalTestBase):
         assert r.json() == {
             "errors": [
                 "expected str @ pull_request_rules → item 0 → actions → label → remove → item 0",
-                "expected str @ pull_request_rules → item 0 → conditions → item 0",
+                "extra keys not allowed @ pull_request_rules → item 0 → conditions → item 0 → -conflict",
             ]
         }
 
@@ -197,7 +200,7 @@ class TestSimulator(base.FunctionalTestBase):
         )
         assert r.status_code == 200, r.json()
         assert r.json()["title"] == "The configuration is valid"
-        assert r.json()["summary"] is None
+        assert r.json()["summary"] == ""
 
         r = await self.app.post(
             "/simulator/",
@@ -210,7 +213,7 @@ class TestSimulator(base.FunctionalTestBase):
 
         assert r.json()["title"] == "1 rule matches"
         assert r.json()["summary"].startswith(
-            f"#### Rule: assign (assign)\n- [X] `base={self.master_branch_name}`\n\n<hr />"
+            f"### Rule: assign (assign)\n- [X] `base={self.master_branch_name}`\n\n<hr />"
         )
 
         r = await self.app.post(

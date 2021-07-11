@@ -37,6 +37,7 @@ async def test_signals(redis_cache):
         {
             "archived": False,
             "url": "",
+            "html_url": "",
             "default_branch": github_types.GitHubRefType(""),
             "id": github_types.GitHubRepositoryIdType(456),
             "full_name": "user/ref",
@@ -57,7 +58,7 @@ async def test_signals(redis_cache):
         client,
         redis_cache,
     )
-    repository = context.Repository(installation, gh_repo["name"], gh_repo["id"])
+    repository = context.Repository(installation, gh_repo)
     ctxt = await context.Context.create(
         repository,
         {
@@ -129,8 +130,6 @@ async def test_signals(redis_cache):
     signals.setup()
     assert len(signals.SIGNALS) == 1
 
-    with mock.patch("datadog.statsd.increment") as increment:
-        await signals.send(ctxt, "action.update")
-        increment.assert_called_once_with(
-            "engine.signals.action.count", tags=["event:update"]
-        )
+    with mock.patch("mergify_engine_signals.noop.Signal.__call__") as signal_method:
+        await signals.send(ctxt, "action.update", {"attr": "value"})
+        signal_method.assert_called_once_with(ctxt, "action.update", {"attr": "value"})

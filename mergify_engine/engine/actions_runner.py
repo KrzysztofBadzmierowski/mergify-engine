@@ -12,7 +12,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 import base64
-import copy
 import typing
 
 from datadog import statsd
@@ -22,6 +21,7 @@ from mergify_engine import check_api
 from mergify_engine import config
 from mergify_engine import constants
 from mergify_engine import context
+from mergify_engine import delayed_refresh
 from mergify_engine import exceptions
 from mergify_engine import github_types
 from mergify_engine import rules
@@ -33,80 +33,79 @@ NOT_APPLICABLE_TEMPLATE = """<details>
 </details>"""
 
 
-def get_already_merged_summary(ctxt, match):
+async def get_already_merged_summary(
+    ctxt: context.Context, match: rules.RulesEvaluator
+) -> str:
     if not (
         ctxt.pull["merged"]
         and any(
             (
-                s["event_type"] == "pull_request" and s["data"]["action"] == "closed"
+                s["event_type"] == "pull_request"
+                and typing.cast(github_types.GitHubEventPullRequest, s["data"])[
+                    "action"
+                ]
+                == "closed"
                 for s in ctxt.sources
             )
         )
     ):
         return ""
 
-    action_merge_found = False
-    action_merge_found_in_active_rule = False
+    action_merge_found_and_ran = False
 
     for rule in match.matching_rules:
         if "merge" in rule.actions:
-            missing_conditions = [
-                condition
-                for condition in rule.missing_conditions
-                if condition.get_attribute_name() not in ["merged", "closed"]
-            ]
-            action_merge_found = True
-            if not missing_conditions:
-                action_merge_found_in_active_rule = True
+            # NOTE(sileht): Replace all -merged -closed by closed/merged and
+            # check it the rule still match if not it has been merged manually
+            custom_conditions = rule.conditions.copy()
+            for condition in custom_conditions.walk():
+                attr = condition.get_attribute_name()
+                if attr == "merged":
+                    condition.update("merged")
+                elif attr == "closed":
+                    condition.update("closed")
+
+            await custom_conditions(ctxt.pull_request)
+            if custom_conditions.match:
+                action_merge_found_and_ran = True
 
     # We already have a fully detailled status in the rule associated with the
     # action merge
-    if not action_merge_found or action_merge_found_in_active_rule:
+    if not action_merge_found_and_ran:
         return ""
 
-    # NOTE(sileht): While this looks impossible because the pull request haven't been
-    # merged by our engine. If this pull request was a slice of another one, Github close
-    # it automatically and put as merged_by the merger of the other one.
-    if ctxt.pull["merged_by"]["login"] == config.BOT_USER_LOGIN:
+    # NOTE(sileht): This looks impossible because the pull request hasn't been
+    # merged by our engine. If this pull request was a slice of another one,
+    # GitHub closes it automatically and put as merged_by the merger of the
+    # other one.
+    if ctxt.pull["merged_by"] is None:
+        merged_by = "???"
+    else:
+        merged_by = ctxt.pull["merged_by"]["login"]
+    if merged_by == config.BOT_USER_LOGIN:
         return (
             "⚠️ The pull request has been closed by GitHub "
             "because its commits are also part of another pull request\n\n"
         )
     else:
-        return (
-            "⚠️ The pull request has been merged by "
-            f"@{ctxt.pull['merged_by']['login']}\n\n"
-        )
+        return "⚠️ The pull request has been merged by " f"@{merged_by}\n\n"
 
 
 async def gen_summary_rules(
     ctxt: context.Context,
     _rules: typing.List[rules.EvaluatedRule],
-    show_actions_rules: bool = False,
 ) -> str:
     summary = ""
     for rule in _rules:
         if rule.hidden:
             continue
-        summary += f"#### Rule: {rule.name}"
-        summary += f" ({', '.join(rule.actions)})"
-        for cond in rule.conditions:
-            checked = " " if cond in rule.missing_conditions else "X"
-            summary += f"\n- [{checked}] `{cond}`"
-
-        if show_actions_rules:
-            for action, action_obj in rule.actions.items():
-                action_rule = await action_obj.get_rule(ctxt)
-                for cond in action_rule.conditions:
-                    checked = " " if cond in action_rule.missing_conditions else "X"
-                    summary += f"\n- [{checked}] `{cond}` ({action} action only, {action_rule.reason})"
-
-        if rule.errors:
-            summary += "\n"
-            for error in rule.errors:
-                summary += f"\n⚠️ {error}"
-
-        summary += "\n\n"
+        if rule.disabled is None:
+            summary += f"### Rule: {rule.name} ({', '.join(rule.actions)})\n"
+        else:
+            summary += f"### Rule: ~~{rule.name} ({', '.join(rule.actions)})~~\n"
+            summary += f":no_entry_sign: **Disabled: {rule.disabled['reason']}**\n"
+        summary += rule.conditions.get_summary()
+        summary += "\n"
     return summary
 
 
@@ -117,13 +116,11 @@ async def gen_summary(
 ) -> typing.Tuple[str, str]:
 
     summary = ""
-    summary += get_already_merged_summary(ctxt, match)
-    summary += await gen_summary_rules(
-        ctxt, match.faulty_rules, show_actions_rules=True
-    )
-    summary += await gen_summary_rules(
-        ctxt, match.matching_rules, show_actions_rules=True
-    )
+    summary += await get_already_merged_summary(ctxt, match)
+    if ctxt.configuration_changed:
+        summary += "⚠️ The configuration has been changed, *queue* and *merge* actions are ignored. ⚠️\n\n"
+    summary += await gen_summary_rules(ctxt, match.faulty_rules)
+    summary += await gen_summary_rules(ctxt, match.matching_rules)
     ignored_rules = len(list(filter(lambda x: not x.hidden, match.ignored_rules)))
 
     if not ctxt.subscription.active:
@@ -141,7 +138,7 @@ async def gen_summary(
         summary += "</details>\n"
 
     completed_rules = len(
-        list(filter(lambda x: not x.missing_conditions, match.matching_rules))
+        list(filter(lambda rule: rule.conditions.match, match.matching_rules))
     )
     potential_rules = len(match.matching_rules) - completed_rules
     faulty_rules = len(match.faulty_rules)
@@ -166,40 +163,23 @@ async def gen_summary(
         if completed_rules == 0 and potential_rules == 0 and faulty_rules == 0:
             summary_title.append("no rules match, no planned actions")
     else:
-        summary_title = ["no rules setuped, just listening for commands"]
+        summary_title = ["no rules configured, just listening for commands"]
 
-    return " and ".join(summary_title), summary
+    title = " and ".join(summary_title)
+    if ctxt.configuration_changed:
+        title = f"Configuration changed. This pull request must be merged manually — {title}"
 
-
-def _filterred_sources_for_logging(data, inplace=False):
-    if not inplace:
-        data = copy.deepcopy(data)
-
-    if isinstance(data, dict):
-        data.pop("node_id", None)
-        data.pop("tree_id", None)
-        data.pop("_links", None)
-        data.pop("external_id", None)
-        for key, value in list(data.items()):
-            if key.endswith("url"):
-                del data[key]
-            else:
-                data[key] = _filterred_sources_for_logging(value, inplace=True)
-        return data
-    elif isinstance(data, list):
-        return [_filterred_sources_for_logging(elem, inplace=True) for elem in data]
-    else:
-        return data
+    return title, summary
 
 
-async def post_summary(
+async def get_summary_check_result(
     ctxt: context.Context,
     pull_request_rules: rules.PullRequestRules,
     match: rules.RulesEvaluator,
     summary_check: typing.Optional[github_types.GitHubCheckRun],
     conclusions: typing.Dict[str, check_api.Conclusion],
     previous_conclusions: typing.Dict[str, check_api.Conclusion],
-) -> None:
+) -> typing.Optional[check_api.Result]:
     summary_title, summary = await gen_summary(ctxt, pull_request_rules, match)
 
     summary += constants.MERGIFY_PULL_REQUEST_DOC
@@ -223,15 +203,13 @@ async def post_summary(
                 "name": ctxt.SUMMARY_NAME,
                 "summary": summary,
             },
-            sources=_filterred_sources_for_logging(ctxt.sources),
+            sources=ctxt.sources,
             conclusions=conclusions,
             previous_conclusions=previous_conclusions,
         )
 
-        await ctxt.set_summary_check(
-            check_api.Result(
-                check_api.Conclusion.SUCCESS, title=summary_title, summary=summary
-            )
+        return check_api.Result(
+            check_api.Conclusion.SUCCESS, title=summary_title, summary=summary
         )
     else:
         ctxt.log.info(
@@ -241,10 +219,14 @@ async def post_summary(
                 "name": ctxt.SUMMARY_NAME,
                 "summary": summary,
             },
-            sources=_filterred_sources_for_logging(ctxt.sources),
+            sources=ctxt.sources,
             conclusions=conclusions,
             previous_conclusions=previous_conclusions,
         )
+        # NOTE(sileht): Here we run the engine, but nothing change so we didn't
+        # update GitHub. In pratice, only the started_at and the ended_at is
+        # not up2date, we don't really care, as no action has ran
+        return None
 
 
 async def exec_action(
@@ -307,7 +289,7 @@ def load_conclusions(
     return {}
 
 
-def serialize_conclusions(conclusions):
+def serialize_conclusions(conclusions: typing.Dict[str, check_api.Conclusion]) -> str:
     return (
         "<!-- "
         + base64.b64encode(
@@ -319,7 +301,11 @@ def serialize_conclusions(conclusions):
     )
 
 
-def get_previous_conclusion(previous_conclusions, name, checks):
+def get_previous_conclusion(
+    previous_conclusions: typing.Dict[str, check_api.Conclusion],
+    name: str,
+    checks: typing.Dict[str, github_types.GitHubCheckRun],
+) -> check_api.Conclusion:
     if name in previous_conclusions:
         return previous_conclusions[name]
     # TODO(sileht): Remove usage of legacy checks after the 15/02/2020 and if the
@@ -356,7 +342,7 @@ async def run_actions(
     # to remove the PR from the queue and then add it back with the new config and not the
     # reverse
     matching_rules = sorted(
-        match.matching_rules, key=lambda rule: len(rule.missing_conditions) == 0
+        match.matching_rules, key=lambda rule: rule.conditions.match
     )
 
     method_name: typing.Literal["run", "cancel"]
@@ -367,9 +353,14 @@ async def run_actions(
 
             done_by_another_action = action_obj.only_once and action in actions_ran
 
-            action_rule = await action_obj.get_rule(ctxt)
-
-            if rule.missing_conditions or action_rule.missing_conditions:
+            if (
+                not rule.conditions.match
+                or rule.disabled is not None
+                or (
+                    ctxt.configuration_changed
+                    and not action_obj.can_be_used_on_configuration_change
+                )
+            ):
                 method_name = "cancel"
                 expected_conclusions = [
                     check_api.Conclusion.NEUTRAL,
@@ -417,61 +408,56 @@ async def run_actions(
                 message = "ignored, another has already been run"
 
             else:
-                # NOTE(sileht): check state change so we have to run "run" or "cancel"
-                report = await exec_action(
-                    method_name,
-                    rule,
-                    action,
-                    ctxt,
-                )
+                with statsd.timed("engine.actions.runtime", tags=[f"name:{action}"]):  # type: ignore[no-untyped-call]
+                    # NOTE(sileht): check state change so we have to run "run" or "cancel"
+                    report = await exec_action(
+                        method_name,
+                        rule,
+                        action,
+                        ctxt,
+                    )
                 message = "executed"
 
+            conclusions[check_name] = report.conclusion
+
             if (
-                report
-                and report.conclusion is not check_api.Conclusion.PENDING
+                report.conclusion is not check_api.Conclusion.PENDING
                 and method_name == "run"
             ):
                 statsd.increment("engine.actions.count", tags=[f"name:{action}"])
 
-            if report:
-                if need_to_be_run and (
-                    not action_obj.silent_report
-                    or report.conclusion
-                    not in (
-                        check_api.Conclusion.SUCCESS,
-                        check_api.Conclusion.CANCELLED,
-                        check_api.Conclusion.PENDING,
+            if need_to_be_run and (
+                not action_obj.silent_report
+                or report.conclusion
+                not in (
+                    check_api.Conclusion.SUCCESS,
+                    check_api.Conclusion.CANCELLED,
+                    check_api.Conclusion.PENDING,
+                )
+            ):
+                external_id = (
+                    check_api.USER_CREATED_CHECKS
+                    if action_obj.allow_retrigger_mergify
+                    else None
+                )
+                try:
+                    await check_api.set_check_run(
+                        ctxt,
+                        check_name,
+                        report,
+                        external_id=external_id,
                     )
-                ):
-                    external_id = (
-                        check_api.USER_CREATED_CHECKS
-                        if action_obj.allow_retrigger_mergify
-                        else None
-                    )
-                    try:
-                        await check_api.set_check_run(
-                            ctxt,
-                            check_name,
-                            report,
-                            external_id=external_id,
+                except Exception as e:
+                    if exceptions.should_be_ignored(e):
+                        ctxt.log.info(
+                            "Fail to post check `%s`", check_name, exc_info=True
                         )
-                    except Exception as e:
-                        if exceptions.should_be_ignored(e):
-                            ctxt.log.info(
-                                "Fail to post check `%s`", check_name, exc_info=True
-                            )
-                        elif exceptions.need_retry(e):
-                            raise
-                        else:
-                            ctxt.log.error(
-                                "Fail to post check `%s`", check_name, exc_info=True
-                            )
-                conclusions[check_name] = report.conclusion
-            else:
-                # NOTE(sileht): action doesn't have report (eg:
-                # comment/request_reviews/..) So just assume it succeed
-                ctxt.log.error("action must return a conclusion", action=action)
-                conclusions[check_name] = expected_conclusions[0]
+                    elif exceptions.need_retry(e):
+                        raise
+                    else:
+                        ctxt.log.error(
+                            "Fail to post check `%s`", check_name, exc_info=True
+                        )
 
             ctxt.log.info(
                 "action evaluation: `%s` %s: %s/%s -> %s",
@@ -493,14 +479,17 @@ async def run_actions(
 
 async def handle(
     pull_request_rules: rules.PullRequestRules, ctxt: context.Context
-) -> None:
+) -> typing.Optional[check_api.Result]:
     match = await pull_request_rules.get_pull_request_rule(ctxt)
+    await delayed_refresh.plan_next_refresh(
+        ctxt, match.matching_rules, ctxt.pull_request
+    )
     checks = {c["name"]: c for c in await ctxt.pull_engine_check_runs}
 
     summary_check = checks.get(ctxt.SUMMARY_NAME)
     previous_conclusions = load_conclusions(ctxt, summary_check)
     conclusions = await run_actions(ctxt, match, checks, previous_conclusions)
-    await post_summary(
+    return await get_summary_check_result(
         ctxt,
         pull_request_rules,
         match,

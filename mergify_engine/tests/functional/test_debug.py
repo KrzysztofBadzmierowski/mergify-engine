@@ -18,6 +18,7 @@ from unittest import mock
 
 import yaml
 
+from mergify_engine import config
 from mergify_engine import debug
 from mergify_engine import subscription
 from mergify_engine.tests.functional import base
@@ -29,7 +30,21 @@ class TestDebugger(base.FunctionalTestBase):
             "pull_request_rules": [
                 {
                     "name": "comment",
-                    "conditions": [f"base={self.master_branch_name}"],
+                    "conditions": [
+                        f"base={self.master_branch_name}",
+                        {
+                            "or": [
+                                "label=doubt",
+                                "label=suspect",
+                            ]
+                        },
+                        {
+                            "and": [
+                                "number>0",
+                                "title~=pull request",
+                            ]
+                        },
+                    ],
                     "actions": {"comment": {"message": "WTF?"}},
                 }
             ]
@@ -60,7 +75,7 @@ class TestDebugger(base.FunctionalTestBase):
 
         assert (
             s1.strip()
-            == f"""* INSTALLATION ID: 15398551
+            == f"""* INSTALLATION ID: {config.INSTALLATION_ID}
 * SUBSCRIBED (cache/db): False / False
 * Features (cache):
   - priority_queues
@@ -82,6 +97,12 @@ pull_request_rules:
       message: WTF?
   conditions:
   - base={self.master_branch_name}
+  - or:
+    - label=doubt
+    - label=suspect
+  - and:
+    - number>0
+    - title~=pull request
   name: comment
 
 * QUEUES: 
@@ -95,7 +116,11 @@ pull_request_rules:
  'changes-requested-reviews-by': [],
  'check-failure': [],
  'check-neutral': [],
+ 'check-pending': [],
+ 'check-skipped': [],
+ 'check-stale': [],
  'check-success': ['Summary'],
+ 'check-success-or-neutral': ['Summary'],
  'closed': False,
  'commented-reviews-by': [],
  'conflict': False,
@@ -116,9 +141,15 @@ pull_request_rules:
 is_behind: False
 mergeable_state: clean
 * MERGIFY LAST CHECKS:
-[Summary]: success | 1 rule matches
-> #### Rule: comment (comment)
+[Summary]: success | 1 potential rule
+> ### Rule: comment (comment)
 > - [X] `base={self.master_branch_name}`
+> - [ ] any of:
+>   - [ ] `label=doubt`
+>   - [ ] `label=suspect`
+> - [X] all of:
+>   - [X] `number>0`
+>   - [X] `title~=pull request`
 > 
 > <hr />
 > :sparkling_heart:&nbsp;&nbsp;Mergify is proud to provide this service for free to open source projects.
@@ -147,11 +178,17 @@ mergeable_state: clean
 > 
 > Finally, you can contact us on https://mergify.io/
 > </details>
-> <!-- J1J1bGU6IGNvbW1lbnQgKGNvbW1lbnQpJzogc3VjY2Vzcwo= -->
+> <!-- J1J1bGU6IGNvbW1lbnQgKGNvbW1lbnQpJzogbmV1dHJhbAo= -->
 * MERGIFY LIVE MATCHES:
-[Summary]: success | 1 rule matches
-> #### Rule: comment (comment)
+[Summary]: success | 1 potential rule
+> ### Rule: comment (comment)
 > - [X] `base={self.master_branch_name}`
+> - [ ] any of:
+>   - [ ] `label=doubt`
+>   - [ ] `label=suspect`
+> - [X] all of:
+>   - [X] `number>0`
+>   - [X] `title~=pull request`
 > 
 > <hr />
 > :sparkling_heart:&nbsp;&nbsp;Mergify is proud to provide this service for free to open source projects.
@@ -162,7 +199,7 @@ mergeable_state: clean
 
         assert (
             s3.strip()
-            == """* INSTALLATION ID: 15398551
+            == f"""* INSTALLATION ID: {config.INSTALLATION_ID}
 * SUBSCRIBED (cache/db): False / False
 * Features (cache):
   - priority_queues

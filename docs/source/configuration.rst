@@ -16,7 +16,7 @@ Mergify uses the configuration file that is:
 - The file named ``.mergify.yml``, or, as a fallback, ``.mergify/config.yml`` or ``.github/mergify.yml``
   from the root directory.
 
-- In the default repository branch configured on GitHub — usually ``master``.
+- In the default repository branch configured on GitHub — usually ``main``.
 
 Format
 ------
@@ -48,6 +48,10 @@ Each dictionary must have the following keys:
      - string
      - The name of the rule. This is not used by the engine directly, but is
        used when reporting information about a rule.
+   * - ``disabled``
+     - dictionary with ``reason`` key
+     - This optional key allows to disabled a rule and cancel any ongoing
+       actions. A reason must be set using the ``reason`` key.
    * - ``conditions``
      - list of :ref:`Conditions`
      - A list of :ref:`Conditions` string that must match against the pull
@@ -130,18 +134,17 @@ Data Types
 Regular Expressions
 ~~~~~~~~~~~~~~~~~~~
 
-.. tip::
-
-  You can use `regex101 <https://regex101.com/>`_, `PyRegex
-  <http://www.pyregex.com>`_ or `Pythex <https://pythex.org/>`_ to test your
-  regular expressions.
-
 You can use regular expression with matching :ref:`operators <Operators>` in
 your :ref:`conditions <Conditions>` .
 
 Mergify leverages `Python regular expressions
 <https://docs.python.org/3/library/re.html>`_ to match rules.
 
+.. tip::
+
+   You can use `regex101 <https://regex101.com/>`_, `PyRegex
+   <http://www.pyregex.com>`_ or `Pythex <https://pythex.org/>`_ to test your
+   regular expressions.
 
 Examples
 ++++++++
@@ -157,9 +160,115 @@ Examples
             add:
               - python
 
-      - name: automatic merge for master when the title does not contain “WIP” (ignoring case)
+      - name: automatic merge for main when the title does not contain “WIP” (ignoring case)
         conditions:
-          - base=master
+          - base=main
+          - -title~=(?i)wip
+        actions:
+          merge:
+            method: merge
+
+.. _time format:
+
+Time
+~~~~
+
+This format represents the time of the day in the 24-hours format.
+It can be used with any of the greater and lesser operators (``>=``, ``>``,
+``<=``, ``<``).
+
+Examples
+++++++++
+
+.. code-block:: yaml
+
+      - name: comment after 18:00
+        conditions:
+          - current-time>=18:00
+        actions:
+          close:
+            message: It's too late for this!
+
+
+.. _iso timestamp:
+
+Timestamp
+~~~~~~~~~
+
+The timestamp format must follow the `ISO 8601 standard
+<https://en.wikipedia.org/wiki/ISO_8601>`_. If the timezone is missing, the
+timestamp is assumed to be in UTC.
+
+.. code-block::
+
+   2021-04-05
+   2012-09-17T22:02:51
+   2008-09-22T14:01:54Z
+   2013-12-05T07:19:04-08:00
+
+Examples
+++++++++
+
+.. code-block:: yaml
+
+      - name: end of life version 10.0
+        conditions:
+          - base=stable/10.0
+          - -closed
+          - current-datetime>=2021-04-05
+        actions:
+          close:
+            message: |
+              The pull request base branch has reached end-of-life.
+
+
+.. _relative timestamp:
+
+Relative Timestamp
+~~~~~~~~~~~~~~~~~~
+
+Timestamps can be expressed relative to the current date and time.
+The format is ``[DD days] [HH:MM] ago``:
+
+* DD, the number of days
+* HH, the number of hours
+* MM, the number of minutes
+
+If the current date is 18th June 2020, ``updated-at>=14 days ago`` will be translated ``updated-at>=2020-06-04T00:00:00``.
+
+Examples
+++++++++
+
+.. code-block:: yaml
+
+      - name: close stale pull request
+        conditions:
+          - base=main
+          - -closed
+          - updated-at<14 days ago
+        actions:
+          close:
+            message: |
+              This pull request looks stale. Feel free to reopen it if you think it's a mistake.
+
+
+Disabling Rules
+~~~~~~~~~~~~~~~
+
+You can disable a rule while keeping it in the configuration. This allows
+gracefully handling the cancellation of any ongoing actions (e.g., like stopping
+the merge queue).
+
+Examples
+++++++++
+
+.. code-block:: yaml
+
+      - name: automatic merge for main when the title does not contain “WIP” (ignoring case)
+        disabled:
+          reason: code freeze
+        conditions:
+          - base=main
           - -title~=(?i)wip
         actions:
           merge:
@@ -167,14 +276,9 @@ Examples
 
 .. _data type template:
 
+
 Template
 ~~~~~~~~
-
-.. note::
-
-   You need to replace the ``-`` character by ``_`` from the :ref:`pull request
-   attribute <attributes>` names when using templates. The ``-`` is not a valid
-   character for variable names in Jinja2 template.
 
 The template data type is a regular string that is rendered using the `Jinja2
 template language <https://jinja.palletsprojects.com/templates/>`_.
@@ -200,6 +304,11 @@ will render to:
 when used in your configuration file — considering the pull request author
 login is ``jd``.
 
+.. note::
+
+   You need to replace the ``-`` character by ``_`` from the :ref:`pull request
+   attribute <attributes>` names when using templates. The ``-`` is not a valid
+   character for variable names in Jinja2 template.
 
 Validation
 ----------

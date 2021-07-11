@@ -16,8 +16,11 @@
 import base64
 import contextlib
 import dataclasses
+import datetime
+import itertools
 import json
 import logging
+import re
 import typing
 from urllib import parse
 
@@ -33,19 +36,20 @@ import tenacity
 from mergify_engine import check_api
 from mergify_engine import config
 from mergify_engine import constants
+from mergify_engine import date
 from mergify_engine import exceptions
 from mergify_engine import github_types
-from mergify_engine import subscription
+from mergify_engine import subscription as subscription_mod
 from mergify_engine import user_tokens
 from mergify_engine import utils
 from mergify_engine.clients import github
 from mergify_engine.clients import http
 
 
-if typing.TYPE_CHECKING:
-    from mergify_engine import worker
+SUMMARY_SHA_EXPIRATION = 60 * 60 * 24 * 31 * 1  # 1 Month
 
-SUMMARY_SHA_EXPIRATION = 60 * 60 * 24 * 31  # ~ 1 Month
+MARKDOWN_TITLE_RE = re.compile(r"^#+ ", re.I)
+MARKDOWN_COMMIT_MESSAGE_RE = re.compile(r"^#+ Commit Message ?:?\s*$", re.I)
 
 
 class MergifyConfigFile(github_types.GitHubContentFile):
@@ -67,20 +71,16 @@ class PullRequestAttributeError(AttributeError):
 class Installation:
     owner_id: github_types.GitHubAccountIdType
     owner_login: github_types.GitHubLogin
-    subscription: subscription.Subscription
-    client: github.AsyncGithubInstallationClient
-    redis: utils.RedisCache
+    subscription: subscription_mod.Subscription = dataclasses.field(repr=False)
+    client: github.AsyncGithubInstallationClient = dataclasses.field(repr=False)
+    redis: utils.RedisCache = dataclasses.field(repr=False)
 
     repositories: "typing.Dict[github_types.GitHubRepositoryName, Repository]" = (
-        dataclasses.field(default_factory=dict)
+        dataclasses.field(default_factory=dict, repr=False)
     )
-    _user_tokens: typing.Optional[user_tokens.UserTokens] = None
-
-    @property
-    def stream_name(self) -> "worker.StreamNameType":
-        return typing.cast(
-            "worker.StreamNameType", f"stream~{self.owner_login}~{self.owner_id}"
-        )
+    _user_tokens: typing.Optional[user_tokens.UserTokens] = dataclasses.field(
+        default=None, repr=False
+    )
 
     async def get_user_tokens(self) -> user_tokens.UserTokens:
         # NOTE(sileht): For the simulator all contexts are built with a user
@@ -98,15 +98,27 @@ class Installation:
             )
         return self._user_tokens
 
-    def get_repository(
+    async def get_pull_request_context(
         self,
-        repo_name: github_types.GitHubRepositoryName,
         repo_id: github_types.GitHubRepositoryIdType,
+        pull_number: github_types.GitHubPullRequestNumber,
+    ) -> "Context":
+        for repository in self.repositories.values():
+            if repository.repo["id"] == repo_id:
+                return await repository.get_pull_request_context(pull_number)
+
+        pull = await self.client.item(f"/repositories/{repo_id}/pulls/{pull_number}")
+        repository = self.get_repository_from_github_data(pull["base"]["repo"])
+        return await repository.get_pull_request_context(pull_number, pull)
+
+    def get_repository_from_github_data(
+        self,
+        repo: github_types.GitHubRepository,
     ) -> "Repository":
-        if repo_name not in self.repositories:
-            repository = Repository(self, repo_name, repo_id)
-            self.repositories[repo_name] = repository
-        return self.repositories[repo_name]
+        if repo["name"] not in self.repositories:
+            repository = Repository(self, repo)
+            self.repositories[repo["name"]] = repository
+        return self.repositories[repo["name"]]
 
     async def get_repository_by_name(
         self,
@@ -117,18 +129,18 @@ class Installation:
         repo_data: github_types.GitHubRepository = await self.client.item(
             f"/repos/{self.owner_login}/{name}"
         )
-        return self.get_repository(repo_data["name"], repo_data["id"])
+        return self.get_repository_from_github_data(repo_data)
 
     async def get_repository_by_id(
         self, _id: github_types.GitHubRepositoryIdType
     ) -> "Repository":
         for repository in self.repositories.values():
-            if repository.id == _id:
+            if repository.repo["id"] == _id:
                 return repository
         repo_data: github_types.GitHubRepository = await self.client.item(
             f"/repositories/{_id}"
         )
-        return self.get_repository(repo_data["name"], repo_data["id"])
+        return self.get_repository_from_github_data(repo_data)
 
     TEAM_MEMBERS_CACHE_KEY_PREFIX = "team_members"
     TEAM_MEMBERS_CACHE_KEY_DELIMITER = "/"
@@ -196,19 +208,18 @@ class RepositoryCache(typing.TypedDict, total=False):
 @dataclasses.dataclass
 class Repository(object):
     installation: Installation
-    name: github_types.GitHubRepositoryName
-    id: github_types.GitHubRepositoryIdType
+    repo: github_types.GitHubRepository
     pull_contexts: "typing.Dict[github_types.GitHubPullRequestNumber, Context]" = (
-        dataclasses.field(default_factory=dict)
+        dataclasses.field(default_factory=dict, repr=False)
     )
 
     # FIXME(sileht): https://github.com/python/mypy/issues/5723
-    _cache: RepositoryCache = dataclasses.field(default_factory=RepositoryCache)  # type: ignore
+    _cache: RepositoryCache = dataclasses.field(default_factory=RepositoryCache, repr=False)  # type: ignore
 
     @property
     def base_url(self) -> str:
         """The URL prefix to make GitHub request."""
-        return f"/repos/{self.installation.owner_login}/{self.name}"
+        return f"/repos/{self.installation.owner_login}/{self.repo['name']}"
 
     MERGIFY_CONFIG_FILENAMES = [
         ".mergify.yml",
@@ -233,9 +244,9 @@ class Repository(object):
         :return: The filename and its content.
         """
 
-        kwargs = {}
+        params = {}
         if ref:
-            kwargs["ref"] = ref
+            params["ref"] = str(ref)
 
         filenames = self.MERGIFY_CONFIG_FILENAMES.copy()
         if preferred_filename:
@@ -248,7 +259,7 @@ class Repository(object):
                     github_types.GitHubContentFile,
                     await self.installation.client.item(
                         f"{self.base_url}/contents/{filename}",
-                        **kwargs,
+                        params=params,
                     ),
                 )
             except http.HTTPNotFound:
@@ -269,7 +280,7 @@ class Repository(object):
             return self._cache["mergify_config"]
 
         config_location_cache = self.get_config_location_cache_key(
-            self.installation.owner_login, self.name
+            self.installation.owner_login, self.repo["name"]
         )
         cached_filename = await self.installation.redis.get(config_location_cache)
         async for config_file in self.iter_mergify_config_files(
@@ -339,7 +350,7 @@ class Repository(object):
     @property
     def _users_permission_cache_key(self) -> str:
         return self._users_permission_cache_key_for_repo(
-            self.installation.owner_id, self.id
+            self.installation.owner_id, self.repo["id"]
         )
 
     @classmethod
@@ -417,7 +428,7 @@ class Repository(object):
     @property
     def _teams_permission_cache_key(self) -> str:
         return self._teams_permission_cache_key_for_repo(
-            self.installation.owner_id, self.id
+            self.installation.owner_id, self.repo["id"]
         )
 
     @classmethod
@@ -467,7 +478,7 @@ class Repository(object):
                 # list as the api endpoint returns 404 if permission read is missing
                 # so no need to check permission
                 await self.installation.client.get(
-                    f"/orgs/{self.installation.owner_login}/teams/{team}/repos/{self.installation.owner_login}/{self.name}",
+                    f"/orgs/{self.installation.owner_login}/teams/{team}/repos/{self.installation.owner_login}/{self.repo['name']}",
                 )
                 read_permission = True
             except http.HTTPNotFound:
@@ -480,6 +491,18 @@ class Repository(object):
             read_permission = bool(int(read_permission_raw))
 
         return read_permission
+
+    async def get_branch_protection_checks(
+        self,
+        branch_name: github_types.GitHubRefType,
+    ) -> typing.List[str]:
+        try:
+            branch = await self.get_branch(branch_name)
+        except http.HTTPNotFound:
+            return []
+        if not branch["protection"]["enabled"]:
+            return []
+        return branch["protection"]["required_status_checks"]["contexts"]
 
 
 class ContextCache(typing.TypedDict, total=False):
@@ -495,13 +518,26 @@ class ContextCache(typing.TypedDict, total=False):
     commits: typing.List[github_types.GitHubBranchCommit]
 
 
+ContextAttributeType = typing.Union[
+    bool,
+    typing.List[str],
+    str,
+    int,
+    datetime.time,
+    date.PartialDatetime,
+    datetime.datetime,
+    date.RelativeDatetime,
+]
+
+
 @dataclasses.dataclass
 class Context(object):
     repository: Repository
     pull: github_types.GitHubPullRequest
     sources: typing.List[T_PayloadEventSource] = dataclasses.field(default_factory=list)
-    pull_request: "PullRequest" = dataclasses.field(init=False)
-    log: logging.LoggerAdapter = dataclasses.field(init=False)
+    configuration_changed: bool = False
+    pull_request: "PullRequest" = dataclasses.field(init=False, repr=False)
+    log: logging.LoggerAdapter = dataclasses.field(init=False, repr=False)
 
     # FIXME(sileht): https://github.com/python/mypy/issues/5723
     _cache: ContextCache = dataclasses.field(default_factory=ContextCache)  # type: ignore
@@ -514,7 +550,7 @@ class Context(object):
         return self.repository.installation.redis
 
     @property
-    def subscription(self) -> subscription.Subscription:
+    def subscription(self) -> subscription_mod.Subscription:
         # TODO(sileht): remove me when context split if done
         return self.repository.installation.subscription
 
@@ -633,19 +669,6 @@ class Context(object):
             ex=SUMMARY_SHA_EXPIRATION,
         )
 
-    async def _get_valid_user_ids(self) -> typing.Set[github_types.GitHubAccountIdType]:
-        return {
-            r["user"]["id"]
-            for r in await self.reviews
-            if (
-                r["user"] is not None
-                and (
-                    r["user"]["type"] == "Bot"
-                    or await self.repository.has_write_permission(r["user"])
-                )
-            )
-        }
-
     async def consolidated_reviews(
         self,
     ) -> typing.Tuple[
@@ -658,7 +681,18 @@ class Context(object):
         # And only keep the last review for each user.
         comments: typing.Dict[github_types.GitHubLogin, github_types.GitHubReview] = {}
         approvals: typing.Dict[github_types.GitHubLogin, github_types.GitHubReview] = {}
-        valid_user_ids = await self._get_valid_user_ids()
+        valid_user_ids = {
+            r["user"]["id"]
+            for r in await self.reviews
+            if (
+                r["user"] is not None
+                and (
+                    r["user"]["type"] == "Bot"
+                    or await self.repository.has_write_permission(r["user"])
+                )
+            )
+        }
+
         for review in await self.reviews:
             if not review["user"] or review["user"]["id"] not in valid_user_ids:
                 continue
@@ -673,7 +707,7 @@ class Context(object):
         )
         return self._cache["consolidated_reviews"]
 
-    async def _get_consolidated_data(self, name):
+    async def _get_consolidated_data(self, name: str) -> ContextAttributeType:
         if name == "assignee":
             return [a["login"] for a in self.pull["assignees"]]
 
@@ -681,9 +715,9 @@ class Context(object):
             return [label["name"] for label in self.pull["labels"]]
 
         elif name == "review-requested":
-            return [u["login"] for u in self.pull["requested_reviewers"]] + [
-                "@" + t["slug"] for t in self.pull["requested_teams"]
-            ]
+            return [
+                typing.cast(str, u["login"]) for u in self.pull["requested_reviewers"]
+            ] + ["@" + t["slug"] for t in self.pull["requested_teams"]]
 
         elif name == "draft":
             return self.pull["draft"]
@@ -692,19 +726,27 @@ class Context(object):
             return self.pull["user"]["login"]
 
         elif name == "merged-by":
-            return self.pull["merged_by"]["login"] if self.pull["merged_by"] else ""
+            return (
+                self.pull["merged_by"]["login"]
+                if self.pull["merged_by"] is not None
+                else ""
+            )
 
         elif name == "merged":
             return self.pull["merged"]
 
         elif name == "closed":
-            return self.pull["state"] == "closed"
+            return self.closed
 
         elif name == "milestone":
-            return self.pull["milestone"]["title"] if self.pull["milestone"] else ""
+            return (
+                self.pull["milestone"]["title"]
+                if self.pull["milestone"] is not None
+                else ""
+            )
 
         elif name == "number":
-            return self.pull["number"]
+            return typing.cast(int, self.pull["number"])
 
         elif name == "conflict":
             return self.pull["mergeable_state"] == "dirty"
@@ -744,14 +786,20 @@ class Context(object):
             comments, _ = await self.consolidated_reviews()
             return [r["user"]["login"] for r in comments if r["state"] == "COMMENTED"]
 
+        elif name == "check-success-or-neutral-or-pending":
+            return [
+                ctxt
+                for ctxt, state in (await self.checks).items()
+                if state in ("success", "neutral", "pending", None)
+            ]
+
         # NOTE(jd) The Check API set conclusion to None for pending.
-        # NOTE(sileht): "pending" statuses are not really trackable, we
-        # voluntary drop this event because CIs just sent they status every
-        # minutes until the CI pass (at least Travis and Circle CI does
-        # that). This was causing a big load on Mergify for nothing useful
-        # tracked, and on big projects it can reach the rate limit very
-        # quickly.
-        # NOTE(sileht): Not handled for now: cancelled, timed_out, or action_required
+        elif name == "check-success-or-neutral":
+            return [
+                ctxt
+                for ctxt, state in (await self.checks).items()
+                if state in ("success", "neutral")
+            ]
         elif name in ("status-success", "check-success"):
             return [
                 ctxt
@@ -759,10 +807,13 @@ class Context(object):
                 if state == "success"
             ]
         elif name in ("status-failure", "check-failure"):
+            # hopefully "cancelled" is actually a failure state to github.
+            # I think it is, however it could be the same thing as the
+            # "skipped" status.
             return [
                 ctxt
                 for ctxt, state in (await self.checks).items()
-                if state == "failure"
+                if state in ["failure", "action_required", "cancelled", "timed_out"]
             ]
         elif name in ("status-neutral", "check-neutral"):
             return [
@@ -770,10 +821,106 @@ class Context(object):
                 for ctxt, state in (await self.checks).items()
                 if state == "neutral"
             ]
+        elif name == "check-skipped":
+            # hopefully this handles the gray "skipped" state that github actions
+            # workflows can send when a job that depends on a job and the job it
+            # depends on fails, making it get skipped automatically then.
+            return [
+                ctext
+                for ctext, state in (await self.checks).items()
+                if state == "skipped"
+            ]
+        elif name == "check":
+            return [ctext for ctext, state in (await self.checks).items()]
+        elif name == "check-pending":
+            return [
+                ctext
+                for ctext, state in (await self.checks).items()
+                if state in (None, "pending")
+            ]
+        elif name == "check-stale":
+            return [
+                ctext
+                for ctext, state in (await self.checks).items()
+                if state == "stale"
+            ]
+        elif name == "depends-on":
+            # TODO(sileht):  This is the list of merged pull requests that are
+            # required by this pull request. An optimisation can be to look at
+            # the merge queues too, to queue this pull request earlier
+            depends_on = []
+            for pull_request_number in self.get_depends_on():
+                try:
+                    ctxt = await self.repository.get_pull_request_context(
+                        pull_request_number
+                    )
+                except http.HTTPNotFound:
+                    continue
+                if ctxt.pull["merged"]:
+                    depends_on.append(f"#{pull_request_number}")
+            return depends_on
+        elif name == "current-timestamp":
+            return date.utcnow()
+        elif name == "current-time":
+            return date.utcnow().timetz()
+        elif name == "current-day":
+            return date.Day(date.utcnow().day)
+        elif name == "current-month":
+            return date.Month(date.utcnow().month)
+        elif name == "current-year":
+            return date.Year(date.utcnow().year)
+        elif name == "current-day-of-week":
+            return date.DayOfWeek(date.utcnow().isoweekday())
+
+        elif name == "updated-at-relative":
+            return date.RelativeDatetime(date.fromisoformat(self.pull["updated_at"]))
+        elif name == "created-at-relative":
+            return date.RelativeDatetime(date.fromisoformat(self.pull["created_at"]))
+        elif name == "closed-at-relative":
+            if self.pull["closed_at"] is None:
+                return date.RelativeDatetime(datetime.datetime.max)
+            return date.RelativeDatetime(date.fromisoformat(self.pull["closed_at"]))
+        elif name == "merged-at-relative":
+            if self.pull["merged_at"] is None:
+                return date.RelativeDatetime(datetime.datetime.max)
+            return date.RelativeDatetime(date.fromisoformat(self.pull["merged_at"]))
+
+        elif name == "updated-at":
+            return date.fromisoformat(self.pull["updated_at"])
+        elif name == "created-at":
+            return date.fromisoformat(self.pull["created_at"])
+        elif name == "closed-at":
+            if self.pull["closed_at"] is None:
+                return date.DT_MAX
+            return date.fromisoformat(self.pull["closed_at"])
+        elif name == "merged-at":
+            if self.pull["merged_at"] is None:
+                return date.DT_MAX
+            return date.fromisoformat(self.pull["merged_at"])
         else:
             raise PullRequestAttributeError(name)
 
-    async def update_pull_check_runs(self, check):
+    DEPENDS_ON = re.compile(
+        r"^ *Depends-On: +(?:#|"
+        + config.GITHUB_URL
+        + r"/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/)(?P<pull>\d+) *$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    def get_depends_on(self) -> typing.Set[github_types.GitHubPullRequestNumber]:
+        if not self.pull["body"]:
+            return set()
+        return {
+            github_types.GitHubPullRequestNumber(int(pull))
+            for owner, repo, pull in self.DEPENDS_ON.findall(self.pull["body"])
+            if (owner == "" and repo == "")
+            or (
+                owner == self.pull["base"]["user"]["login"]
+                and repo == self.pull["base"]["repo"]["name"]
+            )
+        }
+
+    async def update_pull_check_runs(self, check: github_types.GitHubCheckRun) -> None:
         self._cache["pull_check_runs"] = [
             c for c in await self.pull_check_runs if c["name"] != check["name"]
         ]
@@ -827,11 +974,19 @@ class Context(object):
         # so if it has ran twice we must keep only the more recent
         # statuses are good as GitHub already ensures the uniqueness of the name
 
+        # First put all branch protections checks as pending and then override with
+        # the real status
+        checks = {
+            context: "pending"
+            for context in await self.repository.get_branch_protection_checks(
+                self.pull["base"]["ref"]
+            )
+        }
         # NOTE(sileht): conclusion can be one of success, failure, neutral,
         # cancelled, timed_out, or action_required, and  None for "pending"
-        checks = {
-            c["name"]: c["conclusion"] for c in reversed(await self.pull_check_runs)
-        }
+        checks.update(
+            {c["name"]: c["conclusion"] for c in reversed(await self.pull_check_runs)}
+        )
         # NOTE(sileht): state can be one of error, failure, pending,
         # or success.
         checks.update({s["context"]: s["state"] for s in await self.pull_statuses})
@@ -842,12 +997,12 @@ class Context(object):
     # NOTE(sileht): quickly retry, if we don't get the status on time
     # the exception is recatch in worker.py, so worker will retry it later
     @tenacity.retry(
-        wait=tenacity.wait_exponential(multiplier=0.2),
-        stop=tenacity.stop_after_attempt(5),
-        retry=tenacity.retry_if_exception_type(exceptions.MergeableStateUnknown),
+        wait=tenacity.wait_exponential(multiplier=0.2),  # type: ignore[no-untyped-call]
+        stop=tenacity.stop_after_attempt(5),  # type: ignore[no-untyped-call]
+        retry=tenacity.retry_if_exception_type(exceptions.MergeableStateUnknown),  # type: ignore[no-untyped-call]
         reraise=True,
     )
-    async def _ensure_complete(self):
+    async def _ensure_complete(self) -> None:
         if not (
             self._is_data_complete()
             and self._is_background_github_processing_completed()
@@ -861,7 +1016,7 @@ class Context(object):
 
         raise exceptions.MergeableStateUnknown(self)
 
-    def _is_data_complete(self):
+    def _is_data_complete(self) -> bool:
         # NOTE(sileht): If pull request come from /pulls listing or check-runs sometimes,
         # they are incomplete, This ensure we have the complete view
         fields_to_control = (
@@ -876,13 +1031,10 @@ class Context(object):
                 return False
         return True
 
-    def _is_background_github_processing_completed(self):
-        return (
-            self.pull["state"] == "closed"
-            or self.pull["mergeable_state"] not in self.UNUSABLE_STATES
-        )
+    def _is_background_github_processing_completed(self) -> bool:
+        return self.closed or self.pull["mergeable_state"] not in self.UNUSABLE_STATES
 
-    async def update(self):
+    async def update(self) -> None:
         # TODO(sileht): Remove me,
         # Don't use it, because consolidated data are not updated after that.
         # Only used by merge action for posting an update report after rebase.
@@ -919,7 +1071,7 @@ class Context(object):
             "ref"
         ].startswith(constants.MERGE_QUEUE_BRANCH_PREFIX)
 
-    def have_been_synchronized(self) -> bool:
+    def has_been_synchronized(self) -> bool:
         for source in self.sources:
             if source["event_type"] == "pull_request":
                 event = typing.cast(github_types.GitHubEventPullRequest, source["data"])
@@ -929,6 +1081,12 @@ class Context(object):
                 ):
                     return True
         return False
+
+    def has_been_only_refreshed(self) -> bool:
+        for source in self.sources:
+            if source["event_type"] != "refresh":
+                return False
+        return True
 
     def has_been_opened(self) -> bool:
         for source in self.sources:
@@ -991,16 +1149,23 @@ class Context(object):
             file
             async for file in typing.cast(
                 typing.AsyncIterable[github_types.GitHubFile],
-                self.client.items(
-                    f"{self.base_url}/pulls/{self.pull['number']}/files?per_page=100"
-                ),
+                self.client.items(f"{self.base_url}/pulls/{self.pull['number']}/files"),
             )
         ]
         self._cache["files"] = files
         return files
 
     @property
+    def closed(self) -> bool:
+        # NOTE(sileht): GitHub automerge doesn't always close pull requests
+        # when it merges them.
+        return self.pull["state"] == "closed" or self.pull["merged"]
+
+    @property
     def pull_from_fork(self) -> bool:
+        if self.pull["head"]["repo"] is None:
+            # Deleted fork repository
+            return False
         return self.pull["head"]["repo"]["id"] != self.pull["base"]["repo"]["id"]
 
     async def github_workflow_changed(self) -> bool:
@@ -1069,8 +1234,12 @@ class RenderTemplateFailure(Exception):
         return self.message
 
 
+class BasePullRequest:
+    pass
+
+
 @dataclasses.dataclass
-class PullRequest:
+class PullRequest(BasePullRequest):
     """A high level pull request object.
 
     This object is used for templates and rule evaluations.
@@ -1102,27 +1271,37 @@ class PullRequest:
         "changes-requested-reviews-by",
         "commented-reviews-by",
         "check-success",
+        "check-success-or-neutral",
         "check-failure",
         "check-neutral",
         "status-success",
         "status-failure",
         "status-neutral",
+        "check-skipped",
+        "check-pending",
+        "check-stale",
         "files",
     }
 
-    async def __getattr__(self, name):
+    async def __getattr__(self, name: str) -> ContextAttributeType:
         return await self.context._get_consolidated_data(name.replace("_", "-"))
 
     def __iter__(self):
         return iter(self.ATTRIBUTES | self.LIST_ATTRIBUTES)
 
-    async def items(self):
+    async def items(self) -> typing.Dict[str, ContextAttributeType]:
         d = {}
         for k in self:
             d[k] = await getattr(self, k)
         return d
 
-    async def render_template(self, template, extra_variables=None):
+    async def render_template(
+        self,
+        template: str,
+        extra_variables: typing.Optional[
+            typing.Dict[str, typing.Union[str, bool]]
+        ] = None,
+    ) -> str:
         """Render a template interpolating variables based on pull request attributes."""
         env = jinja2.sandbox.SandboxedEnvironment(
             undefined=jinja2.StrictUndefined,
@@ -1148,3 +1327,74 @@ class PullRequest:
             raise RenderTemplateFailure(te.message)
         except PullRequestAttributeError as e:
             raise RenderTemplateFailure(f"Unknown pull request attribute: {e.name}")
+
+    async def get_commit_message(
+        self,
+        mode: typing.Literal["default", "title+body"] = "default",
+    ) -> typing.Optional[typing.Tuple[str, str]]:
+        body = typing.cast(str, await self.body)
+
+        if mode == "title+body":
+            # Include PR number to mimic default GitHub format
+            return (
+                f"{(await self.title)} (#{(await self.number)})",
+                body,
+            )
+
+        if not body:
+            return None
+
+        found = False
+        message_lines = []
+
+        for line in body.split("\n"):
+            if MARKDOWN_COMMIT_MESSAGE_RE.match(line):
+                found = True
+            elif found and MARKDOWN_TITLE_RE.match(line):
+                break
+            elif found:
+                message_lines.append(line)
+
+        # Remove the first empty lines
+        message_lines = list(
+            itertools.dropwhile(lambda x: not x.strip(), message_lines)
+        )
+
+        if found and message_lines:
+            title = message_lines.pop(0)
+
+            # Remove the empty lines between title and message body
+            message_lines = list(
+                itertools.dropwhile(lambda x: not x.strip(), message_lines)
+            )
+
+            return (
+                await self.render_template(title.strip()),
+                await self.render_template(
+                    "\n".join(line.strip() for line in message_lines)
+                ),
+            )
+
+        return None
+
+
+@dataclasses.dataclass
+class QueuePullRequest(BasePullRequest):
+    """Same as PullRequest but for temporary pull request used by merge train.
+
+    This object is used for templates and rule evaluations.
+    """
+
+    context: Context
+    queue_context: Context
+
+    async def __getattr__(self, name: str) -> ContextAttributeType:
+        fancy_name = name.replace("_", "-")
+        if (
+            fancy_name == "check"
+            or fancy_name.startswith("check-")
+            or fancy_name.startswith("status-")
+        ):
+            return await self.queue_context._get_consolidated_data(fancy_name)
+        else:
+            return await self.context._get_consolidated_data(fancy_name)

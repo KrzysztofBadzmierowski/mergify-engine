@@ -23,6 +23,7 @@ from pytest_httpserver import httpserver
 from werkzeug.http import http_date
 from werkzeug.wrappers import Response
 
+from mergify_engine import date
 from mergify_engine import exceptions
 from mergify_engine import github_types
 from mergify_engine.clients import github
@@ -122,7 +123,10 @@ async def test_client_user_token(httpserver: httpserver.HTTPServer) -> None:
         async with github.AsyncGithubInstallationClient(
             github.get_auth(github_types.GitHubLogin("owner"))
         ) as client:
-            ret = await client.get(httpserver.url_for("/"), oauth_token="<user-token>")  # type: ignore[call-arg]
+            ret = await client.get(
+                httpserver.url_for("/"),
+                oauth_token=github_types.GitHubOAuthToken("<user-token>"),
+            )
             assert ret.json()["work"]
 
     assert len(httpserver.log) == 2
@@ -242,7 +246,7 @@ async def _do_test_client_retry_429(
     records = []
 
     def record_date(_):
-        records.append(datetime.datetime.utcnow())
+        records.append(date.utcnow())
         return Response("It works now !", 200)
 
     httpserver.expect_oneshot_request("/").respond_with_data(
@@ -251,7 +255,7 @@ async def _do_test_client_retry_429(
     httpserver.expect_request("/").respond_with_handler(record_date)
 
     async with http.AsyncClient() as client:
-        now = datetime.datetime.utcnow()
+        now = date.utcnow()
         await client.get(httpserver.url_for("/"))
 
     assert len(httpserver.log) == 2
@@ -271,7 +275,7 @@ async def test_client_retry_429_retry_after_as_seconds(
 async def test_client_retry_429_retry_after_as_absolute_date(
     httpserver: httpserver.HTTPServer,
 ) -> None:
-    retry_after = http_date(datetime.datetime.utcnow() + datetime.timedelta(seconds=3))
+    retry_after = http_date(date.utcnow() + datetime.timedelta(seconds=3))
     await _do_test_client_retry_429(httpserver, retry_after, 3)
 
 

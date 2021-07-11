@@ -38,11 +38,34 @@ class GitHubAccount(typing.TypedDict):
 
 GitHubInstallationIdType = typing.NewType("GitHubInstallationIdType", int)
 
+GitHubInstallationPermissionsK = typing.Literal[
+    "checks",
+    "contents",
+    "issues",
+    "metadata",
+    "pages",
+    "pull_requests",
+    "statuses",
+    "members",
+]
+
+
+GitHubInstallationPermissionsV = typing.Literal[
+    "read",
+    "write",
+]
+
+GitHubInstallationPermissions = typing.Dict[
+    GitHubInstallationPermissionsK, GitHubInstallationPermissionsV
+]
+
 
 class GitHubInstallation(typing.TypedDict):
     # https://developer.github.com/v3/apps/#get-an-organization-installation-for-the-authenticated-app
     id: GitHubInstallationIdType
     account: GitHubAccount
+    target_type: GitHubAccountType
+    permissions: GitHubInstallationPermissions
 
 
 GitHubRefType = typing.NewType("GitHubRefType", str)
@@ -61,7 +84,16 @@ class GitHubRepository(typing.TypedDict):
     full_name: str
     archived: bool
     url: str
+    html_url: str
     default_branch: GitHubRefType
+
+
+GitHubRepositoryPermission = typing.Literal["write", "maintain", "admin", "none"]
+
+
+class GitHubRepositoryCollaboratorPermission(typing.TypedDict):
+    permission: GitHubRepositoryPermission
+    user: GitHubAccount
 
 
 GitHubTeamSlug = typing.NewType("GitHubTeamSlug", str)
@@ -179,8 +211,14 @@ GitHubPullRequestNumber = typing.NewType("GitHubPullRequestNumber", int)
 ISODateTimeType = typing.NewType("ISODateTimeType", str)
 
 
+class GitHubMilestone(typing.TypedDict):
+    id: int
+    number: int
+    title: str
+
+
 class GitHubPullRequest(GitHubIssueOrPullRequest):
-    # https://developer.github.com/v3/pulls/#get-a-pull-request
+    # https://docs.github.com/en/rest/reference/pulls#get-a-pull-request
     id: GitHubPullRequestId
     number: GitHubPullRequestNumber
     maintainer_can_modify: bool
@@ -198,8 +236,17 @@ class GitHubPullRequest(GitHubIssueOrPullRequest):
     mergeable_state: GitHubPullRequestMergeableState
     html_url: str
     title: str
+    body: str
     changed_files: int
     commits: int
+    locked: bool
+    assignees: typing.List[GitHubAccount]
+    requested_reviewers: typing.List[GitHubAccount]
+    requested_teams: typing.List[GitHubTeam]
+    milestone: typing.Optional[GitHubMilestone]
+    updated_at: ISODateTimeType
+    created_at: ISODateTimeType
+    closed_at: typing.Optional[ISODateTimeType]
 
 
 # https://docs.github.com/en/free-pro-team@latest/developers/webhooks-and-events/webhook-events-and-payloads
@@ -260,6 +307,9 @@ class GitHubEventPullRequest(GitHubEvent):
     repository: GitHubRepository
     action: GitHubEventPullRequestActionType
     pull_request: GitHubPullRequest
+    # At least in action=synchronize
+    after: SHAType
+    before: SHAType
 
 
 GitHubEventPullRequestReviewCommentActionType = typing.Literal[
@@ -288,6 +338,19 @@ GitHubReviewStateType = typing.Literal[
 ]
 
 
+# https://docs.github.com/en/graphql/reference/enums#commentauthorassociation
+GitHubCommentAuthorAssociation = typing.Literal[
+    "COLLABORATOR",
+    "CONTRIBUTOR",
+    "FIRST_TIMER",
+    "FIRST_TIME_CONTRIBUTOR",
+    "MANNEQUIN",
+    "MEMBER",
+    "NONE",
+    "OWNER",
+]
+
+
 class GitHubReview(typing.TypedDict):
     id: GitHubReviewIdType
     user: GitHubAccount
@@ -295,6 +358,7 @@ class GitHubReview(typing.TypedDict):
     pull_request: GitHubPullRequest
     repository: GitHubRepository
     state: GitHubReviewStateType
+    author_association: GitHubCommentAuthorAssociation
 
 
 class GitHubEventPullRequestReview(GitHubEvent):
@@ -488,3 +552,21 @@ class GitHubGitRef(typing.TypedDict):
 class GitHubRequestedReviewers(typing.TypedDict):
     users: typing.List[GitHubAccount]
     teams: typing.List[GitHubTeam]
+
+
+GitHubApiVersion = typing.Literal["squirrel-girl", "lydian", "groot", "antiope"]
+GitHubOAuthToken = typing.NewType("GitHubOAuthToken", str)
+
+
+GitHubAnnotationLevel = typing.Literal["failure"]
+
+
+class GitHubAnnotation(typing.TypedDict):
+    path: str
+    start_line: int
+    end_line: int
+    start_column: int
+    end_column: int
+    annotation_level: GitHubAnnotationLevel
+    message: str
+    title: str

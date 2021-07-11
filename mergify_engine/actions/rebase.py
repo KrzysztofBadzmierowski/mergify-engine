@@ -24,6 +24,7 @@ from mergify_engine import context
 from mergify_engine import rules
 from mergify_engine import signals
 from mergify_engine import subscription
+from mergify_engine.actions import utils as action_utils
 from mergify_engine.rules import types
 
 
@@ -65,12 +66,15 @@ class RebaseAction(actions.Action):
                     f"Your repository is above {config.NOSUB_MAX_REPO_SIZE_KB} KB.\n{ctxt.subscription.missing_feature_reason(ctxt.pull['base']['repo']['owner']['login'])}",
                 )
 
-            if self.config[
-                "bot_account"
-            ] is not None and not ctxt.subscription.has_feature(
-                subscription.Features.BOT_ACCOUNT
-            ):
-                ctxt.log.info("rebase bot_account used by free plan")
+            bot_account_result = await action_utils.validate_bot_account(
+                ctxt,
+                self.config["bot_account"],
+                option_name="bot_account",
+                required_feature=subscription.Features.BOT_ACCOUNT,
+                missing_feature_message="Rebase with `update_bot_account` set is unavailable",
+            )
+            if bot_account_result is not None:
+                return bot_account_result
 
             try:
                 await branch_updater.rebase_with_git(ctxt, self.config["bot_account"])
@@ -79,11 +83,9 @@ class RebaseAction(actions.Action):
                     check_api.Conclusion.FAILURE, e.title, e.message
                 )
 
-            except branch_updater.AuthenticationFailure as e:
-                return check_api.Result(
-                    check_api.Conclusion.FAILURE, "Branch rebase failed", str(e)
-                )
-            await signals.send(ctxt, "action.rebase")
+            await signals.send(
+                ctxt, "action.rebase", {"bot_account": bool(self.config["bot_account"])}
+            )
             return check_api.Result(
                 check_api.Conclusion.SUCCESS,
                 "Branch has been successfully rebased",

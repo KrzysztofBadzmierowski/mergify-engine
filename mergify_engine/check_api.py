@@ -13,9 +13,11 @@
 # under the License.
 
 import dataclasses
+import datetime
 import enum
 import typing
 
+from mergify_engine import date
 from mergify_engine import github_types
 from mergify_engine import utils
 
@@ -33,7 +35,7 @@ class GitHubCheckRunOutputParameters(typing.TypedDict, total=False):
     title: str
     summary: str
     text: typing.Optional[str]
-    annotations: typing.Optional[typing.List[str]]
+    annotations: typing.Optional[typing.List[github_types.GitHubAnnotation]]
 
 
 class GitHubCheckRunParameters(typing.TypedDict, total=False):
@@ -70,7 +72,9 @@ class Result:
     conclusion: Conclusion
     title: str
     summary: str
-    annotations: typing.Optional[typing.List[str]] = None
+    annotations: typing.Optional[typing.List[github_types.GitHubAnnotation]] = None
+    started_at: typing.Optional[datetime.datetime] = None
+    ended_at: typing.Optional[datetime.datetime] = None
 
 
 async def get_checks_for_ref(
@@ -79,21 +83,28 @@ async def get_checks_for_ref(
     check_name: typing.Optional[str] = None,
 ) -> typing.List[github_types.GitHubCheckRun]:
     if check_name is None:
-        kwargs = {}
+        params = {}
     else:
-        kwargs = {"check_name": check_name}
+        params = {"check_name": check_name}
     checks: typing.List[github_types.GitHubCheckRun] = [
         check
         async for check in ctxt.client.items(
             f"{ctxt.base_url}/commits/{sha}/check-runs",
+            api_version="antiope",
             list_items="check_runs",
-            **kwargs,
+            params=params,
         )
     ]
     return checks
 
 
-def compare_dict(d1, d2, keys):
+_K = typing.TypeVar("_K")
+_V = typing.TypeVar("_V")
+
+
+def compare_dict(
+    d1: typing.Dict[_K, _V], d2: typing.Dict[_K, _V], keys: typing.Iterable[_K]
+) -> bool:
     for key in keys:
         if d1.get(key) != d2.get(key):
             return False
@@ -105,14 +116,16 @@ def check_need_update(
     expected_check: GitHubCheckRunParameters,
 ) -> bool:
     if compare_dict(
-        expected_check,
-        previous_check,
+        typing.cast(typing.Dict[str, typing.Any], expected_check),
+        typing.cast(typing.Dict[str, typing.Any], previous_check),
         ("head_sha", "status", "conclusion", "details_url"),
     ):
         if previous_check["output"] == expected_check["output"]:
             return False
         elif previous_check["output"] is not None and compare_dict(
-            expected_check["output"], previous_check["output"], ("title", "summary")
+            typing.cast(typing.Dict[str, typing.Any], expected_check["output"]),
+            typing.cast(typing.Dict[str, typing.Any], previous_check["output"]),
+            ("title", "summary"),
         ):
             return False
 
@@ -130,12 +143,14 @@ async def set_check_run(
     else:
         status = Status.COMPLETED
 
+    started_at = (result.started_at or date.utcnow()).isoformat()
+
     post_parameters = GitHubCheckRunParameters(
         {
             "name": name,
             "head_sha": ctxt.pull["head"]["sha"],
             "status": typing.cast(github_types.GitHubCheckRunStatus, status.value),
-            "started_at": utils.utcnow().isoformat(),
+            "started_at": typing.cast(github_types.ISODateTimeType, started_at),
             "details_url": f"{ctxt.pull['html_url']}/checks",
             "output": {
                 "title": result.title,
@@ -157,8 +172,11 @@ async def set_check_run(
         post_parameters["external_id"] = external_id
 
     if status is Status.COMPLETED:
+        ended_at = (result.ended_at or date.utcnow()).isoformat()
         post_parameters["conclusion"] = result.conclusion.value
-        post_parameters["completed_at"] = utils.utcnow().isoformat()
+        post_parameters["completed_at"] = typing.cast(
+            github_types.ISODateTimeType, ended_at
+        )
 
     checks = sorted(
         (c for c in await ctxt.pull_engine_check_runs if c["name"] == name),
@@ -171,6 +189,7 @@ async def set_check_run(
         if Status(check_to_cancelled["status"]) != Status.COMPLETED:
             await ctxt.client.patch(
                 f"{ctxt.base_url}/check-runs/{check_to_cancelled['id']}",
+                api_version="antiope",
                 json={
                     "conclusion": Conclusion.CANCELLED.value,
                     "status": Status.COMPLETED.value,
@@ -188,6 +207,7 @@ async def set_check_run(
             (
                 await ctxt.client.post(
                     f"{ctxt.base_url}/check-runs",
+                    api_version="antiope",
                     json=post_parameters,
                 )
             ).json(),
@@ -202,6 +222,7 @@ async def set_check_run(
                 (
                     await ctxt.client.patch(
                         f"{ctxt.base_url}/check-runs/{checks[0]['id']}",
+                        api_version="antiope",
                         json=post_parameters,
                     )
                 ).json(),

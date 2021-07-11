@@ -18,13 +18,6 @@ the development branch are ported back to the stable branch(es). The stable
 branch can then be used to release a new minor version of the software, fixing
 some of its bugs.
 
-.. important::
-
-   |premium plan tag|
-   |essential plan tag|
-   If the repository is bigger than 512 MB, the ``backport`` action is only
-   available for `Essential and Premium subscribers <https://mergify.io/pricing>`_.
-
 As this process of backporting patches can be tedious, Mergify automates this
 mechanism to save developers' time and ease their duty.
 
@@ -36,6 +29,12 @@ automatically delete the backport head branch that it created.
 
 You can also trigger backports using the :ref:`backport command` command.
 
+.. warning::
+
+   |premium plan tag|
+   |essential plan tag|
+   If the repository is bigger than 512 MB, the ``backport`` action is only
+   available for `Essential and Premium subscribers <https://mergify.io/pricing>`_.
 
 Options
 -------
@@ -62,6 +61,13 @@ Options
      - ``true``
      - Whether to create the pull requests even if they are conflicts when
        cherry-picking the commits.
+   * - ``bot_account``
+     - :ref:`data type template`
+     -
+     - |premium plan tag|
+       Mergify can impersonate a GitHub user to backport a pull request.
+       If no ``bot_account`` is set, Mergify backports the pull request
+       itself.
    * - ``labels``
      - list of string
      - ``[]``
@@ -81,13 +87,18 @@ Options
      - :ref:`data type template`
      - ``{{ title }} (backport #{{ number }})``
      - The pull request title.
+   * - ``body``
+     - :ref:`data type template`
+     - ``This is an automatic backport of pull request #{{number}} done by [Mergify](https://mergify.io).\n{{cherry_pick_error}}``
+     - The pull request body.
 
 
-As the ``title`` is a :ref:`template <data type template>`, you can
+As the ``title`` and ``body`` are :ref:`templates <data type template>`, you can
 leverage any pull request attributes to use as content, e.g. ``{{author}}``.
 You can also use this additional variable:
 
     * ``{{ destination_branch }}``: the name of destination branch.
+    * ``{{ cherry_pick_error }}``: the cherry pick error message if any (only available in ``body``).
 
 Examples
 --------
@@ -105,7 +116,7 @@ added and the pull request merged:
     pull_request_rules:
       - name: backport patches to stable branch
         conditions:
-          - base=master
+          - base=main
           - label=backport-to-stable
         actions:
           backport:

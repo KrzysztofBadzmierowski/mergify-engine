@@ -1,6 +1,6 @@
 # -*- encoding: utf-8 -*-
 #
-# Copyright © 2020 Mergify SAS
+# Copyright © 2020–2021 Mergify SAS
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,15 +14,17 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import datetime
 import json
 import os
 import sys
+import typing
 
 import daiquiri
 import httpx
 import tenacity
 from werkzeug.http import parse_date
+
+from mergify_engine import date
 
 
 LOG = daiquiri.getLogger(__name__)
@@ -34,11 +36,13 @@ PYTHON_VERSION = (
 )
 HTTPX_VERSION = httpx.__version__
 
+DEFAULT_HEADERS = {
+    "Accept": "application/vnd.github.machine-man-preview+json",
+    "User-Agent": f"mergify-engine/{ENGINE_VERSION} deploy/{DEPLOY_VERSION} python/${PYTHON_VERSION} httpx/{HTTPX_VERSION}",
+}
+
 DEFAULT_CLIENT_OPTIONS = {
-    "headers": {
-        "Accept": "application/vnd.github.machine-man-preview+json",
-        "User-Agent": f"mergify-engine/{ENGINE_VERSION} deploy/{DEPLOY_VERSION} python/${PYTHON_VERSION} httpx/{HTTPX_VERSION}",
-    },
+    "headers": DEFAULT_HEADERS,
     "timeout": httpx.Timeout(5.0, read=10.0),
 }
 
@@ -111,7 +115,7 @@ def wait_retry_after_header(retry_state):
     d = parse_date(value)
     if d is None:
         return 0
-    return max(0, (d - datetime.datetime.utcnow()).total_seconds())
+    return max(0, (d - date.utcnow()).total_seconds())
 
 
 def extract_github_extra(client):
@@ -165,25 +169,25 @@ def after_log(retry_state):
 
 connectivity_issue_retry = tenacity.retry(
     reraise=True,
-    retry=tenacity.retry_if_exception_type(
+    retry=tenacity.retry_if_exception_type(  # type: ignore[no-untyped-call]
         (RequestError, HTTPServerSideError, HTTPTooManyRequests)
     ),
-    wait=tenacity.wait_combine(
-        wait_retry_after_header, tenacity.wait_exponential(multiplier=0.2)
+    wait=tenacity.wait_combine(  # type: ignore[no-untyped-call]
+        wait_retry_after_header, tenacity.wait_exponential(multiplier=0.2)  # type: ignore[no-untyped-call]
     ),
-    stop=tenacity.stop_after_attempt(5),
+    stop=tenacity.stop_after_attempt(5),  # type: ignore[no-untyped-call]
     before=before_log,
     after=after_log,
 )
 
 
-def raise_for_status(resp):
+def raise_for_status(resp: httpx.Response) -> None:
     if httpx.codes.is_client_error(resp.status_code):
         error_type = "Client Error"
-        default_exception = HTTPClientSideError
+        exc_class = STATUS_CODE_TO_EXC.get(resp.status_code, HTTPClientSideError)
     elif httpx.codes.is_server_error(resp.status_code):
         error_type = "Server Error"
-        default_exception = HTTPServerSideError
+        exc_class = STATUS_CODE_TO_EXC.get(resp.status_code, HTTPServerSideError)
     else:
         return
 
@@ -196,13 +200,12 @@ def raise_for_status(resp):
         details = resp.text if resp.text else "<empty-response>"
 
     message = f"{resp.status_code} {error_type}: {resp.reason_phrase} for url `{resp.url}`\nDetails: {details}"
-    exc_class = STATUS_CODE_TO_EXC.get(resp.status_code, default_exception)
     raise exc_class(message, request=resp.request, response=resp)
 
 
 class AsyncClient(httpx.AsyncClient):
     @connectivity_issue_retry
-    async def request(self, method, url, *args, **kwargs):
-        resp = await super().request(method, url, *args, **kwargs)
+    async def request(self, *args: typing.Any, **kwargs: typing.Any) -> httpx.Response:
+        resp = await super().request(*args, **kwargs)
         raise_for_status(resp)
         return resp

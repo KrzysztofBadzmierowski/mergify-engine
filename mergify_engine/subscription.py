@@ -46,6 +46,7 @@ class Features(enum.Enum):
     MERGE_BOT_ACCOUNT = "merge_bot_account"
     BOT_ACCOUNT = "bot_account"
     QUEUE_ACTION = "queue_action"
+    DEPENDS_ON = "depends_on"
 
 
 class SubscriptionDict(typing.TypedDict):
@@ -60,6 +61,7 @@ class SubscriptionDict(typing.TypedDict):
             "random_request_reviews",
             "merge_bot_account",
             "queue_action",
+            "depends_on",
         ]
     ]
 
@@ -211,8 +213,8 @@ class SubscriptionDashboardGitHubCom(SubscriptionBase):
                     f"{config.SUBSCRIPTION_BASE_URL}/engine/subscription/{owner_id}",
                     auth=(config.OAUTH_CLIENT_ID, config.OAUTH_CLIENT_SECRET),
                 )
-            except http.HTTPNotFound as e:
-                return cls(redis, owner_id, False, e.message, frozenset())
+            except http.HTTPNotFound:
+                raise exceptions.MergifyNotInstalled()
             else:
                 sub = resp.json()
                 return cls.from_dict(redis, owner_id, sub)
@@ -223,9 +225,6 @@ class SubscriptionDashboardOnPremise(SubscriptionBase):
     async def _retrieve_subscription_from_db(
         cls: typing.Type[SubscriptionT], redis: utils.RedisCache, owner_id: int
     ) -> SubscriptionT:
-
-        print(config.SUBSCRIPTION_BASE_URL)
-        print(f"{config.SUBSCRIPTION_BASE_URL}/on-premise/subscription/{owner_id}")
         async with http.AsyncClient() as client:
             try:
                 resp = await client.get(

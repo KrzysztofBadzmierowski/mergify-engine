@@ -21,16 +21,6 @@ A condition is a string that has the following format::
 
   [ "-" ] [ "#" ] <attribute> [ <operator> <value> ]
 
-.. important::
-
-   The ``#`` character is considered as a comment delimiter in YAML. As ``#``
-   is the length operator in Mergify's conditions system, don't forget to use
-   ``"`` around the condition to write valid YAML syntax.
-
-.. note::
-
-  ``operator`` and ``value`` are only optional if the ``attribute`` type is
-  ``Boolean``.
 
 - The optional ``-`` prefix is equivalent to the `not` operator.
 
@@ -58,6 +48,51 @@ For example:
   pull request.
 
 - ``-merged`` matches if the pull requested has not been merged.
+
+.. important::
+
+   The ``#`` character is considered as a comment delimiter in YAML. As ``#``
+   is the length operator in Mergify's conditions system, don't forget to use
+   ``"`` around the condition to write valid YAML syntax.
+
+.. note::
+
+  ``operator`` and ``value`` are only optional if the ``attribute`` type is
+  ``Boolean``.
+
+Combining Conditions with Operators
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The `conditions` do support the ``or`` and ``and`` operators.
+
+For example, you can match if its author is ``foo`` or
+``bar``, you could write:
+
+.. code-block:: yaml
+
+    conditions:
+      - or:
+        - author=foo
+        - author=bar
+
+You can also combine ``or`` and ``and`` like this:
+
+.. code-block:: yaml
+
+    conditions:
+      - or:
+        - and:
+            author=foo
+            label=core
+        - and:
+            author=bar
+            label=backend
+
+
+.. note::
+
+    The depth on combined conditions is limited to 3.
+
 
 .. _attributes:
 
@@ -177,6 +212,14 @@ Here's the list of pull request attribute that can be used in conditions:
        `continuous-integration/travis-ci/pr` or of a *check run* such as
        `Travis CI - Pull Request`. See `About Status Checks`_ for more
        details.
+   * - ``check-success-or-neutral``
+     - list of string
+     - The list of status checks that successfully passed or are neutral for
+       the pull request.
+       This is the name of a *status check* such as
+       `continuous-integration/travis-ci/pr` or of a *check run* such as
+       `Travis CI - Pull Request`. See `About Status Checks`_ for more
+       details.
    * - ``check-failure``
      - list of string
      - The list of status checks that failed for the pull request.
@@ -184,9 +227,85 @@ Here's the list of pull request attribute that can be used in conditions:
        `continuous-integration/travis-ci/pr` or of a *check run* such as
        `Travis CI - Pull Request`. See `About Status Checks`_ for more
        details.
+       Checks that report being cancelled, timed out, and action
+       required are also considered as failures.
+   * - ``check-skipped``
+     - list of string
+     - The list of status checks that was skipped for the pull request.
+       This is the name of a *status check* such as
+       `continuous-integration/travis-ci/pr` or of a *check run* such as
+       `Travis CI - Pull Request`. See `About Status Checks`_ for more
+       details.
+   * - ``check-pending``
+     - list of string
+     - The list of status checks that is pending for the pull request.
+       This is the name of a *status check* such as
+       `continuous-integration/travis-ci/pr` or of a *check run* such as
+       `Travis CI - Pull Request`. See `About Status Checks`_ for more
+       details.
+   * - ``check-stale``
+     - list of string
+     - The list of status checks that are stale for the pull request.
+       This is the name of a *status check* such as
+       `continuous-integration/travis-ci/pr` or of a *check run* such as
+       `Travis CI - Pull Request`. See `About Status Checks`_ for more
+       details.
    * - ``title``
      - string
      - The title of the pull request.
+   * - ``created-at``
+     - :ref:`Timestamp <iso timestamp>` or :ref:`Relative timestamp <relative timestamp>`
+     - The time the pull request was created at.
+   * - ``updated-at``
+     - :ref:`Timestamp <iso timestamp>` or :ref:`Relative timestamp <relative timestamp>`
+     - The time the pull request was updated at.
+   * - ``merged-at``
+     - :ref:`Timestamp <iso timestamp>` or :ref:`Relative timestamp <relative timestamp>`
+     - The time the pull request was merged at.
+   * - ``closed-at``
+     - :ref:`Timestamp <iso timestamp>` or :ref:`Relative timestamp <relative timestamp>`
+     - The time the pull request was closed at.
+   * - ``current-timestamp``
+     - :ref:`Timestamp <iso timestamp>`
+     - The current date and time.
+   * - ``current-time``
+     - :ref:`Time <time format>`
+     - The current time in format ``HH:MM``.
+   * - ``current-day``
+     - integer
+     - The current day of the month, from 1 to 31.
+   * - ``current-month``
+     - integer
+     - The current month, from 1 to 12.
+   * - ``current-year``
+     - integer
+     - The current year, from 1900 to 9999.
+   * - ``current-day-of-week``
+     - integer or string
+     - The current day of the week. From 1 (Monday) to 7 (Sunday), or one of
+       ``Mon``, ``Tue``, ``Wed``, ``Thu``, ``Fri``, ``Sat``, ``Sun``,
+       ``Monday``, ``Tuesday``, ``Wednesday``, ``Thursday``, ``Friday``,
+       ``Saturday``, ``Sunday``. Weeks start on Monday.
+   * - ``schedule``
+     - string
+     - A schedule, e.g., ``Mon-Fri``, ``12:00-18:00`` or ``Mon-Fri 12:00-18:00``
+
+
+.. warning::
+
+   Time-based conditions have a 5 minutes precision at best. Do not write
+   conditions based on time ranges that are too narrow or the condition might
+   never be true.
+
+.. note::
+
+   ``current-datetime``, ``current-time``, ``created-at``, ``updated-at``,
+   ``closed-at`` and ``merged-at`` do not support the ``~=``, ``=`` and ``!=``
+   operators. ``schedule`` only supports the ``=`` and ``!=`` operators.
+
+.. note::
+
+   The timezone for all time-based conditions is UTC.
 
 .. _Operators:
 
@@ -280,43 +399,14 @@ modified files:
   the ``src`` directory.
 
 
-Implementing Or Conditions
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The `conditions` do not support the `or` operation. As Mergify evaluates and
-apply every matching rules from your configuration, you can implement multiple
-rules in order to have this.
-
-For example, to automatically merge a pull request if its author is ``foo`` or
-``bar``, you could write:
-
-.. code-block:: yaml
-
-    pull_request_rules:
-      - name: automatic merge if author is foo
-        conditions:
-          - author=foo
-          - check-success=Travis CI - Pull Request
-        actions:
-          merge:
-            method: merge
-
-      - name: automatic merge if author is bar
-        conditions:
-          - author=bar
-          - check-success=Travis CI - Pull Request
-        actions:
-          merge:
-            method: merge
-
-
 About Status Checks
 ~~~~~~~~~~~~~~~~~~~
 
 Generic Status Check
 ++++++++++++++++++++
 
-When using the ``check-success``, ``check-neutral`` and ``check-failure``
+When using the ``check-success``, ``check-neutral``, ``check-failure``,
+``check-skipped``, ``check-pending``, and ``check-stale``
 conditions, you need to use the name of your check service. This can be find by
 opening an existing pull request and scrolling down near the ``Merge`` button.
 

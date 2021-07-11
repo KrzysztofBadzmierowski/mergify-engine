@@ -22,36 +22,79 @@ import daiquiri
 from mergify_engine import config
 from mergify_engine import crypto
 from mergify_engine import exceptions
+from mergify_engine import github_types
 from mergify_engine import utils
 from mergify_engine.clients import http
 
 
+if typing.TYPE_CHECKING:
+    from mergify_engine import context
+
 LOG = daiquiri.getLogger(__name__)
 
 
-class UserTokensDict(typing.TypedDict):
-    tokens: typing.Dict[str, str]
+class UserTokensUserNotFound(Exception):
+    reason: str
+
+
+class UserTokensUser(typing.TypedDict):
+    login: github_types.GitHubLogin
+    oauth_access_token: github_types.GitHubOAuthToken
+    name: typing.Optional[str]
+    email: typing.Optional[str]
 
 
 @dataclasses.dataclass
 class UserTokens:
     redis: utils.RedisCache
     owner_id: int
-    tokens: typing.Dict[str, str]
+    users: typing.List[UserTokensUser]
     ttl: int = -2
 
     RETENTION_SECONDS = 60 * 60 * 24 * 3  # 3 days
     VALIDITY_SECONDS = 3600
 
     @staticmethod
+    async def select_users_for(
+        ctxt: "context.Context", bot_account: typing.Optional[str] = None
+    ) -> typing.List[UserTokensUser]:
+        user_tokens = await ctxt.repository.installation.get_user_tokens()
+        if bot_account:
+            user = user_tokens.get_token_for(bot_account)
+            if user:
+                users = [user]
+            else:
+                raise UserTokensUserNotFound(
+                    f"User `{bot_account}` is unknown. Please make sure `{bot_account}` has logged in Mergify dashboard."
+                )
+        else:
+            users = user_tokens.users
+
+        # Pick author first
+        users = sorted(users, key=lambda x: x["login"] != ctxt.pull["user"]["login"])
+        return users
+
+    @staticmethod
     def _cache_key(owner_id: int) -> str:
         return f"user-tokens-cache-owner-{owner_id}"
 
-    def get_token_for(self, wanted_login: str) -> typing.Optional[str]:
+    @staticmethod
+    def _get_users_from_config() -> typing.List[UserTokensUser]:
+        return [
+            {
+                "login": github_types.GitHubLogin(login),
+                "oauth_access_token": github_types.GitHubOAuthToken(oauth_access_token),
+                "email": None,
+                "name": None,
+            }
+            for login, oauth_access_token in config.ACCOUNT_TOKENS.items()
+        ]
+
+    def get_token_for(self, wanted_login: str) -> typing.Optional[UserTokensUser]:
         wanted_login = wanted_login.lower()
-        for login, token in (self.tokens | config.ACCOUNT_TOKENS).items():
-            if login.lower() == wanted_login:
-                return token
+        for user in self.users + self._get_users_from_config():
+            if user["login"].lower() == wanted_login:
+                return user
         return None
 
     async def _has_expired(self) -> bool:
@@ -89,7 +132,7 @@ class UserTokens:
         await self.redis.setex(
             self._cache_key(self.owner_id),
             self.RETENTION_SECONDS,
-            crypto.encrypt(json.dumps({"tokens": self.tokens}).encode()),
+            crypto.encrypt(json.dumps({"user_tokens": self.users}).encode()),
         )
         self.ttl = self.RETENTION_SECONDS
 
@@ -104,10 +147,10 @@ class UserTokens:
                     auth=(config.OAUTH_CLIENT_ID, config.OAUTH_CLIENT_SECRET),
                 )
             except http.HTTPNotFound:
-                return cls(redis, owner_id, {})
+                return cls(redis, owner_id, [])
             else:
                 tokens = resp.json()
-                return cls(redis, owner_id, tokens["tokens"])
+                return cls(redis, owner_id, tokens["user_tokens"])
 
     @classmethod
     async def _retrieve_from_cache(
@@ -120,12 +163,13 @@ class UserTokens:
                 typing.Tuple[str, int], await pipe.execute()
             )
         if encrypted_tokens:
-            return cls(
-                redis,
-                owner_id,
-                json.loads(crypto.decrypt(encrypted_tokens.encode()).decode())[
-                    "tokens"
-                ],
-                ttl,
+            decrypted_tokens = json.loads(
+                crypto.decrypt(encrypted_tokens.encode()).decode()
             )
+
+            if "tokens" in decrypted_tokens:
+                # Old cache format, just drop it
+                return None
+
+            return cls(redis, owner_id, decrypted_tokens["user_tokens"], ttl)
         return None

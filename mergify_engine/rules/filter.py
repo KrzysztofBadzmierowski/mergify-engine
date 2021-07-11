@@ -13,13 +13,18 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+from collections import abc
 import dataclasses
+import datetime
 import inspect
 import operator
 import re
 import typing
 
-from mergify_engine.rules import parser
+from mergify_engine import date
+
+
+_T = typing.TypeVar("_T")
 
 
 class InvalidQuery(Exception):
@@ -27,40 +32,40 @@ class InvalidQuery(Exception):
 
 
 class ParseError(InvalidQuery):
-    def __init__(self, tree):
+    def __init__(self, tree: "TreeT") -> None:
         super().__init__(f"Unable to parse tree: {str(tree)}")
         self.tree = tree
 
 
 class UnknownAttribute(InvalidQuery, ValueError):
-    def __init__(self, key):
+    def __init__(self, key: str) -> None:
         super().__init__(f"Unknown attribute: {str(key)}")
         self.key = key
 
 
 class UnknownOperator(InvalidQuery, ValueError):
-    def __init__(self, operator):
+    def __init__(self, operator: str) -> None:
         super().__init__(f"Unknown operator: {str(operator)}")
         self.operator = operator
 
 
 class InvalidOperator(InvalidQuery, TypeError):
-    def __init__(self, operator):
+    def __init__(self, operator: str) -> None:
         super().__init__(f"Invalid operator: {str(operator)}")
         self.operator = operator
 
 
 class InvalidArguments(InvalidQuery, ValueError):
-    def __init__(self, arguments):
+    def __init__(self, arguments: typing.Any) -> None:
         super().__init__(f"Invalid arguments: {str(arguments)}")
         self.arguments = arguments
 
 
-def _identity(value):
+def _identity(value: _T) -> _T:
     return value
 
 
-TreeBinaryLeafT = typing.Tuple[typing.Any, typing.Any]
+TreeBinaryLeafT = typing.Tuple[str, typing.Any]
 
 TreeT = typing.TypedDict(
     "TreeT",
@@ -74,6 +79,9 @@ TreeT = typing.TypedDict(
         ">=": TreeBinaryLeafT,
         "!=": TreeBinaryLeafT,
         "~=": TreeBinaryLeafT,
+        "@": typing.Union["TreeT", "CompiledTreeT[GetAttrObject]"],  # type: ignore[misc]
+        "or": typing.Iterable[typing.Union["TreeT", "CompiledTreeT[GetAttrObject]"]],  # type: ignore[misc]
+        "and": typing.Iterable[typing.Union["TreeT", "CompiledTreeT[GetAttrObject]"]],  # type: ignore[misc]
     },
     total=False,
 )
@@ -85,60 +93,34 @@ class GetAttrObject(typing.Protocol):
 
 
 GetAttrObjectT = typing.TypeVar("GetAttrObjectT", bound=GetAttrObject)
+FilterResultT = typing.TypeVar("FilterResultT")
+CompiledTreeT = typing.Callable[[GetAttrObjectT], typing.Awaitable[FilterResultT]]
+
+
+UnaryOperatorT = typing.Callable[[typing.Any], FilterResultT]
+BinaryOperatorT = typing.Tuple[
+    typing.Callable[[typing.Any, typing.Any], FilterResultT],
+    typing.Callable[[typing.Iterable[object]], FilterResultT],
+    typing.Callable[[typing.Any], typing.Any],
+]
+MultipleOperatorT = typing.Callable[..., FilterResultT]
 
 
 @dataclasses.dataclass(repr=False)
-class Filter:
-    tree: TreeT
-
-    unary_operators: typing.ClassVar[
-        typing.Dict[str, typing.Callable[[typing.Any], bool]]
-    ] = {"-": operator.not_}
-
-    binary_operators: typing.ClassVar[
-        typing.Dict[
-            str,
-            typing.Tuple[
-                typing.Callable[[typing.Any, typing.Any], bool],
-                typing.Callable[[typing.Iterable[object]], bool],
-                typing.Callable[[typing.Any], typing.Any],
-            ],
-        ]
-    ] = {
-        "=": (operator.eq, any, _identity),
-        "<": (operator.lt, any, _identity),
-        ">": (operator.gt, any, _identity),
-        "<=": (operator.le, any, _identity),
-        ">=": (operator.ge, any, _identity),
-        "!=": (operator.ne, all, _identity),
-        "~=": (lambda a, b: a is not None and b.search(a), any, re.compile),
-    }
-
-    # The name of the attribute that is going to be evaluated by this filter.
-    attribute_name: str = dataclasses.field(init=False)
+class Filter(typing.Generic[FilterResultT]):
+    tree: typing.Union[TreeT, CompiledTreeT[GetAttrObject, FilterResultT]]
+    unary_operators: typing.Dict[str, UnaryOperatorT[FilterResultT]]
+    binary_operators: typing.Dict[str, BinaryOperatorT[FilterResultT]]
+    multiple_operators: typing.Dict[str, MultipleOperatorT[FilterResultT]]
 
     value_expanders: typing.Dict[
         str, typing.Callable[[typing.Any], typing.List[typing.Any]]
-    ] = dataclasses.field(default_factory=dict)
+    ] = dataclasses.field(default_factory=dict, init=False)
 
-    _eval: typing.Callable[
-        ["Filter", GetAttrObjectT], typing.Awaitable[bool]
-    ] = dataclasses.field(init=False)
+    _eval: CompiledTreeT[GetAttrObject, FilterResultT] = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
-        # https://github.com/python/mypy/issues/2427
-        self._eval = self.build_evaluator(self.tree)  # type: ignore
-
-    def get_attribute_name(self):
-        tree = self.tree.get("-", self.tree)
-        name = list(tree.values())[0][0]
-        if name.startswith(self.LENGTH_OPERATOR):
-            return name[1:]
-        return name
-
-    @classmethod
-    def parse(cls, string: str) -> "Filter":
-        return cls(parser.search.parseString(string, parseAll=True)[0])
+        self._eval = self.build_evaluator(self.tree)
 
     def __str__(self):
         return self._tree_to_str(self.tree)
@@ -147,6 +129,9 @@ class Filter:
         # We don't do any kind of validation here since build_evaluator does
         # that.
         op, nodes = list(tree.items())[0]
+
+        if op in self.multiple_operators:
+            return "(" + f" {op} ".join(self._tree_to_str(n) for n in nodes) + ")"
         if op in self.unary_operators:
             return op + self._tree_to_str(nodes)
         if op in self.binary_operators:
@@ -154,22 +139,36 @@ class Filter:
                 if self.binary_operators[op][0] != operator.eq:
                     raise InvalidOperator(op)
                 return ("" if nodes[1] else "-") + str(nodes[0])
-            return str(nodes[0]) + op + str(nodes[1])
+            elif isinstance(nodes[1], datetime.datetime):
+                return (
+                    str(nodes[0])
+                    + op
+                    + nodes[1].replace(tzinfo=None).isoformat(timespec="seconds")
+                )
+            elif isinstance(nodes[1], datetime.time):
+                return (
+                    str(nodes[0])
+                    + op
+                    + nodes[1].replace(tzinfo=None).isoformat(timespec="minutes")
+                )
+            else:
+                return str(nodes[0]) + op + str(nodes[1])
         raise InvalidOperator(op)  # pragma: no cover
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"{self.__class__.__name__}({str(self)})"
 
-    async def __call__(self, obj: GetAttrObjectT) -> bool:
+    async def __call__(self, obj: GetAttrObjectT) -> FilterResultT:
         return await self._eval(obj)
 
     LENGTH_OPERATOR = "#"
 
-    def _to_list(self, item: typing.Any) -> typing.List[typing.Any]:
-        if isinstance(item, list):
-            return item
+    @staticmethod
+    def _to_list(item: typing.Union[_T, typing.Iterable[_T]]) -> typing.List[_T]:
+        if isinstance(item, str):
+            return [typing.cast(_T, item)]
 
-        if isinstance(item, tuple):
+        if isinstance(item, abc.Iterable):
             return list(item)
 
         return [item]
@@ -179,75 +178,315 @@ class Filter:
         obj: GetAttrObjectT,
         attribute_name: str,
     ) -> typing.List[typing.Any]:
+        op: typing.Callable[[typing.Any], typing.Any]
         if attribute_name.startswith(self.LENGTH_OPERATOR):
-            self.attribute_name = attribute_name[1:]
+            attribute_name = attribute_name[1:]
             op = len
         else:
-            self.attribute_name = attribute_name
+            attribute_name = attribute_name
             op = _identity
         try:
-            attr = getattr(obj, self.attribute_name)
+            attr = getattr(obj, attribute_name)
             if inspect.iscoroutine(attr):
                 attr = await attr
         except KeyError:
-            raise UnknownAttribute(self.attribute_name)
+            raise UnknownAttribute(attribute_name)
         try:
             values = op(attr)
         except TypeError:
-            raise InvalidOperator(self.attribute_name)
+            raise InvalidOperator(attribute_name)
 
         return self._to_list(values)
 
     def build_evaluator(
-        self, tree: TreeT
-    ) -> typing.Callable[[GetAttrObjectT], typing.Awaitable[bool]]:
+        self,
+        tree: typing.Union[TreeT, CompiledTreeT[GetAttrObject, FilterResultT]],
+    ) -> CompiledTreeT[GetAttrObject, FilterResultT]:
+        if callable(tree):
+            return tree
+
         if len(tree) != 1:
             raise ParseError(tree)
+
         operator_name, nodes = list(tree.items())[0]
+
+        if operator_name == "@":
+            # NOTE(sileht): the value is already a TreeT, so just evaluate it.
+            # e.g., {"@", ("schedule", {"and": [{"=", ("time", "10:10"), ...}]})}
+            return self.build_evaluator(typing.cast(typing.Tuple[str, TreeT], nodes)[1])
+
         try:
-            unary_op = self.unary_operators[operator_name]
+            multiple_op = self.multiple_operators[operator_name]
         except KeyError:
             try:
-                binary_op, iterable_op, compile_fn = self.binary_operators[
-                    operator_name
-                ]
+                unary_operator = self.unary_operators[operator_name]
             except KeyError:
-                raise UnknownOperator(operator_name)
+                try:
+                    binary_operator = self.binary_operators[operator_name]
+                except KeyError:
+                    raise UnknownOperator(operator_name)
+                nodes = typing.cast(TreeBinaryLeafT, nodes)
+                return self._handle_binary_op(binary_operator, nodes)
+            nodes = typing.cast(TreeT, nodes)
+            return self._handle_unary_op(unary_operator, nodes)
+        if not isinstance(nodes, abc.Iterable):
+            raise InvalidArguments(nodes)
+        return self._handle_multiple_op(multiple_op, nodes)
 
-            nodes = typing.cast(TreeBinaryLeafT, nodes)
-            if len(nodes) != 2:
-                raise InvalidArguments(nodes)
+    def _handle_binary_op(
+        self,
+        op: BinaryOperatorT[FilterResultT],
+        nodes: TreeBinaryLeafT,
+    ) -> CompiledTreeT[GetAttrObject, FilterResultT]:
+        if len(nodes) != 2:
+            raise InvalidArguments(nodes)
 
-            try:
-                attribute_name, reference_value = (nodes[0], compile_fn(nodes[1]))
-            except Exception as e:
-                raise InvalidArguments(str(e))
+        binary_op, iterable_op, compile_fn = op
+        try:
+            attribute_name, reference_value = (nodes[0], compile_fn(nodes[1]))
+        except Exception as e:
+            raise InvalidArguments(str(e))
 
-            async def _cmp(attribute_values: typing.List[typing.Any]) -> bool:
-                reference_value_expander = self.value_expanders.get(
-                    attribute_name, self._to_list
+        async def _op(obj: GetAttrObjectT) -> FilterResultT:
+            attribute_values = await self._get_attribute_values(obj, attribute_name)
+            reference_value_expander = self.value_expanders.get(
+                attribute_name, self._to_list
+            )
+            ref_values_expanded = reference_value_expander(reference_value)
+            if inspect.iscoroutine(ref_values_expanded):
+                ref_values_expanded = await typing.cast(
+                    typing.Awaitable[typing.Any], ref_values_expanded
                 )
-                ref_values_expanded = reference_value_expander(reference_value)
-                if inspect.iscoroutine(ref_values_expanded):
-                    ref_values_expanded = await typing.cast(
-                        typing.Awaitable[typing.Any], ref_values_expanded
-                    )
 
-                return iterable_op(
-                    binary_op(attribute_value, ref_value)
-                    for attribute_value in attribute_values
-                    for ref_value in ref_values_expanded
-                )
+            return iterable_op(
+                binary_op(attribute_value, ref_value)
+                for attribute_value in attribute_values
+                for ref_value in ref_values_expanded
+            )
 
-            async def _op(obj: GetAttrObjectT) -> bool:
-                return await _cmp(await self._get_attribute_values(obj, attribute_name))
+        return _op
 
-            return _op
-
-        nodes = typing.cast(TreeT, nodes)
+    def _handle_unary_op(
+        self, unary_op: UnaryOperatorT[FilterResultT], nodes: TreeT
+    ) -> CompiledTreeT[GetAttrObject, FilterResultT]:
         element = self.build_evaluator(nodes)
 
-        async def _unary_op(values: GetAttrObjectT) -> bool:
+        async def _unary_op(values: GetAttrObjectT) -> FilterResultT:
             return unary_op(await element(values))
 
         return _unary_op
+
+    def _handle_multiple_op(
+        self,
+        multiple_op: MultipleOperatorT[FilterResultT],
+        nodes: typing.Iterable[
+            typing.Union[TreeT, CompiledTreeT[GetAttrObject, FilterResultT]]
+        ],
+    ) -> CompiledTreeT[GetAttrObject, FilterResultT]:
+        elements = [self.build_evaluator(node) for node in nodes]
+
+        async def _multiple_op(values: GetAttrObjectT) -> FilterResultT:
+            return multiple_op([await element(values) for element in elements])
+
+        return _multiple_op
+
+
+def BinaryFilter(
+    tree: typing.Union[TreeT, CompiledTreeT[GetAttrObject, bool]],
+) -> "Filter[bool]":
+    return Filter[bool](
+        tree,
+        {"-": operator.not_},
+        {
+            "=": (operator.eq, any, _identity),
+            "<": (operator.lt, any, _identity),
+            ">": (operator.gt, any, _identity),
+            "<=": (operator.le, any, _identity),
+            ">=": (operator.ge, any, _identity),
+            "!=": (operator.ne, all, _identity),
+            "~=": (lambda a, b: a is not None and b.search(a), any, re.compile),
+        },
+        {
+            "or": any,
+            "and": all,
+        },
+    )
+
+
+def _minimal_datetime(dts: typing.Iterable[object]) -> datetime.datetime:
+    _dts = list(typing.cast(typing.List[datetime.datetime], Filter._to_list(dts)))
+    if len(_dts) == 0:
+        return date.DT_MAX
+    else:
+        return min(_dts)
+
+
+def _as_datetime(value: typing.Any) -> datetime.datetime:
+    if isinstance(value, datetime.datetime):
+        return value
+    elif isinstance(value, date.RelativeDatetime):
+        return value.value
+    elif isinstance(value, datetime.timedelta):
+        dt = date.utcnow()
+        return dt + value
+    elif isinstance(value, date.PartialDatetime):
+        dt = date.utcnow().replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if isinstance(value, date.DayOfWeek):
+            return dt + datetime.timedelta(days=value.value - dt.isoweekday())
+        elif isinstance(value, date.Day):
+            return dt.replace(day=value.value)
+        elif isinstance(value, date.Month):
+            return dt.replace(month=value.value, day=1)
+        elif isinstance(value, date.Year):
+            return dt.replace(year=value.value, month=1, day=1)
+        else:
+            return date.DT_MAX
+    elif isinstance(value, datetime.time):
+        return date.utcnow().replace(
+            hour=value.hour,
+            minute=value.minute,
+            second=value.second,
+            microsecond=value.microsecond,
+        )
+    else:
+        return date.DT_MAX
+
+
+def _dt_max(value: typing.Any, ref: typing.Any) -> datetime.datetime:
+    return date.DT_MAX
+
+
+def _dt_identity_max(value: typing.Any) -> datetime.datetime:
+    return date.DT_MAX
+
+
+def _dt_in_future(value: datetime.datetime) -> datetime.datetime:
+    if value < date.utcnow():
+        return date.DT_MAX
+    return value
+
+
+def _dt_op(
+    op: typing.Callable[[typing.Any, typing.Any], bool],
+) -> typing.Callable[[typing.Any, typing.Any], datetime.datetime]:
+    def _operator(value: typing.Any, ref: typing.Any) -> datetime.datetime:
+        try:
+            dt_value = _as_datetime(value)
+            dt_ref = _as_datetime(ref)
+            handle_equality = op in (
+                operator.eq,
+                operator.ne,
+                operator.le,
+                operator.ge,
+            )
+            if handle_equality and dt_value == dt_ref:
+                # NOTE(sileht): The condition will change...
+                if isinstance(ref, date.PartialDatetime):
+                    if isinstance(value, date.DayOfWeek):
+                        # next day
+                        dt_ref = dt_ref + datetime.timedelta(days=1)
+                    elif isinstance(ref, date.Day):
+                        # next day
+                        dt_ref = dt_ref + datetime.timedelta(days=1)
+                    elif isinstance(ref, date.Month):
+                        # first day of next month
+                        dt_ref = dt_ref.replace(day=1)
+                        dt_ref = dt_ref + datetime.timedelta(days=32)
+                        dt_ref = dt_ref.replace(day=1)
+                    elif isinstance(ref, date.Year):
+                        # first day of next year
+                        dt_ref = dt_ref.replace(month=1, day=1)
+                        dt_ref = dt_ref + datetime.timedelta(days=366)
+                        dt_ref = dt_ref.replace(month=1, day=1)
+                    return _dt_in_future(
+                        dt_ref.replace(hour=0, minute=0, second=0, microsecond=0)
+                    )
+                elif isinstance(ref, date.RelativeDatetime):
+                    return date.utcnow() + datetime.timedelta(minutes=1)
+                else:
+                    return _dt_in_future(dt_ref + datetime.timedelta(minutes=1))
+            elif dt_value < dt_ref:
+                if isinstance(ref, date.RelativeDatetime):
+                    if op in (operator.ge, operator.gt):
+                        return _dt_in_future(date.utcnow() + (dt_ref - dt_value))
+                    else:
+                        return date.DT_MAX
+                else:
+                    return _dt_in_future(dt_ref)
+            else:
+                if isinstance(ref, datetime.time):
+                    # Condition will change next day at 00:00:00
+                    dt_ref = dt_ref + datetime.timedelta(days=1)
+                elif isinstance(value, date.DayOfWeek):
+                    dt_ref = dt_ref + datetime.timedelta(days=7)
+                elif isinstance(ref, date.Day):
+                    # Condition will change, 1st day of next month at 00:00:00
+                    dt_ref = dt_ref.replace(day=1)
+                    dt_ref = dt_ref + datetime.timedelta(days=32)
+                    if op in (operator.eq, operator.ne):
+                        dt_ref = dt_ref.replace(day=ref.value)
+                    else:
+                        dt_ref = dt_ref.replace(day=1)
+                elif isinstance(ref, date.Month):
+                    # Condition will change, 1st January of next year at 00:00:00
+                    dt_ref = dt_ref.replace(month=1, day=1)
+                    dt_ref = dt_ref + datetime.timedelta(days=366)
+                    if op in (operator.eq, operator.ne):
+                        dt_ref = dt_ref.replace(month=ref.value, day=1)
+                    else:
+                        dt_ref = dt_ref.replace(month=1, day=1)
+                elif isinstance(ref, date.RelativeDatetime):
+                    if op in (operator.le, operator.lt):
+                        return _dt_in_future(date.utcnow() + (dt_value - dt_ref))
+                    else:
+                        return date.DT_MAX
+                else:
+                    return date.DT_MAX
+                if op in (operator.eq, operator.ne):
+                    return _dt_in_future(dt_ref)
+                else:
+                    return _dt_in_future(
+                        dt_ref.replace(hour=0, minute=0, second=0, microsecond=0)
+                    )
+        except OverflowError:
+            return date.DT_MAX
+
+    return _operator
+
+
+def NearDatetimeFilter(
+    tree: typing.Union[TreeT, CompiledTreeT[GetAttrObject, datetime.datetime]],
+) -> "Filter[datetime.datetime]":
+    """
+    The principes:
+    * the attribute can't be mapped to a datetime -> datetime.datetime.max
+    * the time/datetime attribute can't change in the future -> datetime.datetime.max
+    * the time/datetime attribute can change in the future -> return when
+    * we have a list of time/datetime, we pick the more recent
+    """
+    return Filter[datetime.datetime](
+        tree,
+        # NOTE(sileht): This is not allowed in parser on all time based attributes
+        # so we can just return DT_MAX for all other attributes
+        {"-": _dt_identity_max},
+        {
+            "=": (_dt_op(operator.eq), _minimal_datetime, _identity),
+            "<": (_dt_op(operator.lt), _minimal_datetime, _identity),
+            ">": (_dt_op(operator.gt), _minimal_datetime, _identity),
+            "<=": (_dt_op(operator.le), _minimal_datetime, _identity),
+            ">=": (_dt_op(operator.ge), _minimal_datetime, _identity),
+            "!=": (_dt_op(operator.ne), _minimal_datetime, _identity),
+            # NOTE(sileht): This is not allowed in parser on all time based attributes
+            # so we can just return DT_MAX for all other attributes
+            "~=": (_dt_max, _minimal_datetime, re.compile),
+        },
+        {
+            "or": _minimal_datetime,
+            "and": _minimal_datetime,
+        },
+    )

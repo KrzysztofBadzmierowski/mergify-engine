@@ -1,6 +1,6 @@
 # -*- encoding: utf-8 -*-
 #
-# Copyright © 2020 Mergify SAS
+# Copyright © 2020–2021 Mergify SAS
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -22,6 +22,8 @@ import typing
 
 import dotenv
 import voluptuous
+
+from mergify_engine import github_types
 
 
 GITHUB_APP = os.environ.get("MERGIFYENGINE_MODE", "github_app") == "github_app"
@@ -46,11 +48,10 @@ def CoercedLoggingLevel(value: str) -> int:
 
 
 def CommaSeparatedStringList(value: str) -> typing.List[str]:
-    return value.split(",")
-
-
-def CommaSeparatedIntList(value: str) -> typing.List[int]:
-    return [int(s) for s in value.split(",")]
+    if value:
+        return value.split(",")
+    else:
+        return []
 
 
 def AccountTokens(v: str) -> typing.Dict[str, str]:
@@ -67,6 +68,9 @@ def AccountTokens(v: str) -> typing.Dict[str, str]:
 Schema = voluptuous.Schema(
     {
         # Logging
+        voluptuous.Required(
+            "LOG_DEBUG_LOGGER_NAMES", default=""
+        ): CommaSeparatedStringList,
         voluptuous.Required("LOG_LEVEL", default="INFO"): CoercedLoggingLevel,
         voluptuous.Required("LOG_RATELIMIT", default=False): CoercedBool,
         voluptuous.Required("LOG_STDOUT", default=True): CoercedBool,
@@ -141,13 +145,25 @@ Schema = voluptuous.Schema(
             float
         ),
         # For test suite only (eg: tox -erecord)
+        voluptuous.Required(
+            "TESTING_FORWARDER_ENDPOINT",
+            default="https://test-forwarder.mergify.io/events",
+        ): str,
         voluptuous.Required("INSTALLATION_ID", default=15398551): voluptuous.Coerce(
             int
         ),
         voluptuous.Required(
+            "TESTING_REPOSITORY_ID", default=258840104
+        ): voluptuous.Coerce(int),
+        voluptuous.Required(
+            "TESTING_REPOSITORY_NAME", default="functional-testing-repo"
+        ): str,
+        voluptuous.Required(
             "TESTING_ORGANIZATION_ID", default=40527191
         ): voluptuous.Coerce(int),
-        voluptuous.Required("TESTING_ORGANIZATION", default="mergifyio-testing"): str,
+        voluptuous.Required(
+            "TESTING_ORGANIZATION_NAME", default="mergifyio-testing"
+        ): str,
         voluptuous.Required(
             "ORG_ADMIN_PERSONAL_TOKEN",
             default="<ORG_ADMIN_PERSONAL_TOKEN>",
@@ -175,6 +191,7 @@ GITHUB_API_URL: str
 WEBHOOK_MARKETPLACE_FORWARD_URL: str
 WEBHOOK_APP_FORWARD_URL: str
 WEBHOOK_FORWARD_EVENT_TYPES: str
+WEBHOOK_SECRET: str
 STREAM_PROCESSES: int
 STREAM_WORKERS_PER_PROCESS: int
 EXTERNAL_USER_PERSONAL_TOKEN: str
@@ -197,6 +214,20 @@ WORKER_SHUTDOWN_TIMEOUT: float
 REDIS_SSL_VERIFY_MODE_CERT_NONE: bool
 REDIS_STREAM_WEB_MAX_CONNECTIONS: typing.Optional[int]
 REDIS_CACHE_WEB_MAX_CONNECTIONS: typing.Optional[int]
+TESTING_ORGANIZATION_ID: github_types.GitHubAccountIdType
+TESTING_ORGANIZATION_NAME: github_types.GitHubLogin
+TESTING_REPOSITORY_ID: github_types.GitHubRepositoryIdType
+TESTING_REPOSITORY_NAME: str
+TESTING_FORWARDER_ENDPOINT: str
+LOG_LEVEL: int  # This is converted to an int by voluptuous
+LOG_STDOUT: bool
+LOG_STDOUT_LEVEL: int  # This is converted to an int by voluptuous
+LOG_DATADOG: bool
+LOG_DATADOG_LEVEL: int  # This is converted to an int by voluptuous
+LOG_DEBUG_LOGGER_NAMES: typing.List[str]
+ORG_ADMIN_PERSONAL_TOKEN: str
+ORG_ADMIN_GITHUB_APP_OAUTH_TOKEN: github_types.GitHubOAuthToken
+ORG_USER_PERSONAL_TOKEN: github_types.GitHubOAuthToken
 
 configuration_file = os.getenv("MERGIFYENGINE_TEST_SETTINGS")
 if configuration_file:

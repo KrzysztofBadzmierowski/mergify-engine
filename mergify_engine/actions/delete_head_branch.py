@@ -38,12 +38,13 @@ class DeleteHeadBranchAction(actions.Action):
                 check_api.Conclusion.SUCCESS, "Pull request come from fork", ""
             )
 
-        if ctxt.pull["state"] == "closed":
+        if ctxt.closed:
             if not self.config["force"]:
                 pulls_using_this_branch = [
                     branch
                     async for branch in ctxt.client.items(
-                        f"{ctxt.base_url}/pulls", base=ctxt.pull["head"]["ref"]
+                        f"{ctxt.base_url}/pulls",
+                        params={"base": ctxt.pull["head"]["ref"]},
                     )
                 ]
                 if pulls_using_this_branch:

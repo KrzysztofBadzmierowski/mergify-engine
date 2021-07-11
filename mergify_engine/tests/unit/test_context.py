@@ -13,10 +13,12 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+import typing
 from unittest import mock
 
 import pytest
 
+from mergify_engine import config
 from mergify_engine import context
 from mergify_engine import github_types
 from mergify_engine import subscription
@@ -30,8 +32,8 @@ async def test_user_permission_cache(redis_cache: utils.RedisCache) -> None:
     class FakeClient(github.AsyncGithubInstallationClient):
         called: int
 
-        def __init__(self, owner, repo):
-            super().__init__(auth=None)
+        def __init__(self, owner: str, repo: str) -> None:
+            super().__init__(auth=None)  # type: ignore[arg-type]
             self.owner = owner
             self.repo = repo
             self.called = 0
@@ -72,6 +74,7 @@ async def test_user_permission_cache(redis_cache: utils.RedisCache) -> None:
             "full_name": "",
             "archived": False,
             "url": "",
+            "html_url": "",
             "default_branch": github_types.GitHubRefType(""),
             "name": github_types.GitHubRepositoryName("test"),
             "private": False,
@@ -108,7 +111,7 @@ async def test_user_permission_cache(redis_cache: utils.RedisCache) -> None:
     installation = context.Installation(
         gh_owner["id"], gh_owner["login"], sub, client, redis_cache
     )
-    repository = context.Repository(installation, gh_repo["name"], gh_repo["id"])
+    repository = context.Repository(installation, gh_repo)
     assert client.called == 0
     assert await repository.has_write_permission(user_1)
     assert client.called == 1
@@ -128,6 +131,7 @@ async def test_user_permission_cache(redis_cache: utils.RedisCache) -> None:
             "full_name": "",
             "archived": False,
             "url": "",
+            "html_url": "",
             "default_branch": github_types.GitHubRefType(""),
             "name": github_types.GitHubRepositoryName("test2"),
             "private": False,
@@ -138,7 +142,7 @@ async def test_user_permission_cache(redis_cache: utils.RedisCache) -> None:
     installation = context.Installation(
         gh_owner["id"], gh_owner["login"], sub, client, redis_cache
     )
-    repository = context.Repository(installation, gh_repo["name"], gh_repo["id"])
+    repository = context.Repository(installation, gh_repo)
     assert client.called == 0
     assert await repository.has_write_permission(user_2)
     assert client.called == 1
@@ -172,8 +176,8 @@ async def test_team_members_cache(redis_cache: utils.RedisCache) -> None:
     class FakeClient(github.AsyncGithubInstallationClient):
         called: int
 
-        def __init__(self, owner):
-            super().__init__(auth=None)
+        def __init__(self, owner: str) -> None:
+            super().__init__(auth=None)  # type: ignore[arg-type]
             self.owner = owner
             self.called = 0
 
@@ -248,13 +252,13 @@ async def test_team_permission_cache(redis_cache: utils.RedisCache) -> None:
     class FakeClient(github.AsyncGithubInstallationClient):
         called: int
 
-        def __init__(self, owner, repo):
-            super().__init__(auth=None)
+        def __init__(self, owner: str, repo: str) -> None:
+            super().__init__(auth=None)  # type: ignore[arg-type]
             self.owner = owner
             self.repo = repo
             self.called = 0
 
-        async def get(self, url, *args, **kwargs):
+        async def get(self, url: str, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:  # type: ignore[override]
             self.called += 1
             if (
                 url
@@ -294,6 +298,7 @@ async def test_team_permission_cache(redis_cache: utils.RedisCache) -> None:
             "full_name": "",
             "archived": False,
             "url": "",
+            "html_url": "",
             "default_branch": github_types.GitHubRefType(""),
             "name": github_types.GitHubRepositoryName("test"),
             "private": False,
@@ -309,7 +314,7 @@ async def test_team_permission_cache(redis_cache: utils.RedisCache) -> None:
     installation = context.Installation(
         gh_owner["id"], gh_owner["login"], sub, client, redis_cache
     )
-    repository = context.Repository(installation, gh_repo["name"], gh_repo["id"])
+    repository = context.Repository(installation, gh_repo)
     assert client.called == 0
     assert await repository.team_has_read_permission(team_slug1)
     assert client.called == 1
@@ -329,6 +334,7 @@ async def test_team_permission_cache(redis_cache: utils.RedisCache) -> None:
             "full_name": "",
             "archived": False,
             "url": "",
+            "html_url": "",
             "default_branch": github_types.GitHubRefType(""),
             "name": github_types.GitHubRepositoryName("test2"),
             "private": False,
@@ -339,7 +345,7 @@ async def test_team_permission_cache(redis_cache: utils.RedisCache) -> None:
     installation = context.Installation(
         gh_owner["id"], gh_owner["login"], sub, client, redis_cache
     )
-    repository = context.Repository(installation, gh_repo["name"], gh_repo["id"])
+    repository = context.Repository(installation, gh_repo)
     assert client.called == 0
     assert not await repository.team_has_read_permission(team_slug2)
     assert client.called == 1
@@ -366,3 +372,123 @@ async def test_team_permission_cache(redis_cache: utils.RedisCache) -> None:
     )
     assert not await repository.team_has_read_permission(team_slug2)
     assert client.called == 7
+
+
+@pytest.mark.asyncio
+async def test_context_depends_on():
+    gh_owner = github_types.GitHubAccount(
+        {
+            "login": github_types.GitHubLogin("user"),
+            "id": github_types.GitHubAccountIdType(0),
+            "type": "User",
+            "avatar_url": "",
+        }
+    )
+
+    gh_repo = github_types.GitHubRepository(
+        {
+            "archived": False,
+            "url": "",
+            "html_url": "",
+            "default_branch": github_types.GitHubRefType(""),
+            "id": github_types.GitHubRepositoryIdType(456),
+            "full_name": "user/repo",
+            "name": github_types.GitHubRepositoryName("repo"),
+            "private": False,
+            "owner": gh_owner,
+        }
+    )
+
+    pull = github_types.GitHubPullRequest(
+        {
+            "locked": False,
+            "assignees": [],
+            "requested_reviewers": [],
+            "requested_teams": [],
+            "milestone": None,
+            "title": "",
+            "updated_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+            "created_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+            "closed_at": None,
+            "id": github_types.GitHubPullRequestId(0),
+            "maintainer_can_modify": False,
+            "rebaseable": False,
+            "draft": False,
+            "merge_commit_sha": None,
+            "labels": [],
+            "number": github_types.GitHubPullRequestNumber(6),
+            "commits": 1,
+            "merged": True,
+            "state": "closed",
+            "changed_files": 1,
+            "html_url": "<html_url>",
+            "base": {
+                "label": "",
+                "sha": github_types.SHAType("sha"),
+                "user": {
+                    "login": github_types.GitHubLogin("user"),
+                    "id": github_types.GitHubAccountIdType(0),
+                    "type": "User",
+                    "avatar_url": "",
+                },
+                "ref": github_types.GitHubRefType("ref"),
+                "label": "",
+                "repo": gh_repo,
+            },
+            "head": {
+                "label": "",
+                "sha": github_types.SHAType("old-sha-one"),
+                "ref": github_types.GitHubRefType("fork"),
+                "user": {
+                    "login": github_types.GitHubLogin("user"),
+                    "id": github_types.GitHubAccountIdType(0),
+                    "type": "User",
+                    "avatar_url": "",
+                },
+                "repo": {
+                    "archived": False,
+                    "url": "",
+                    "html_url": "",
+                    "default_branch": github_types.GitHubRefType(""),
+                    "id": github_types.GitHubRepositoryIdType(123),
+                    "full_name": "fork/other",
+                    "name": github_types.GitHubRepositoryName("other"),
+                    "private": False,
+                    "owner": {
+                        "login": github_types.GitHubLogin("user"),
+                        "id": github_types.GitHubAccountIdType(0),
+                        "type": "User",
+                        "avatar_url": "",
+                    },
+                },
+            },
+            "user": {
+                "login": github_types.GitHubLogin("user"),
+                "id": github_types.GitHubAccountIdType(0),
+                "type": "User",
+                "avatar_url": "",
+            },
+            "merged_by": None,
+            "merged_at": None,
+            "mergeable_state": "clean",
+            "body": f"""header
+
+Depends-On: #123
+depends-on: {config.GITHUB_URL}/foo/bar/pull/999
+depends-on: {config.GITHUB_URL}/foo/bar/999
+depends-on: azertyuiopqsdfghjklmwxcvbn
+depends-on: https://somewhereelse.com/foo/bar/999
+Depends-oN: {config.GITHUB_URL}/user/repo/pull/456
+Depends-oN: {config.GITHUB_URL}/user/repo/pull/789
+ DEPENDS-ON: #42
+Depends-On:  #48
+Depends-On:  #999 with crap
+DePeNdS-oN: {config.GITHUB_URL}/user/repo/pull/999 with crap
+
+footer
+""",
+        },
+    )
+
+    ctxt = await context.Context.create(mock.Mock(), pull)
+    assert ctxt.get_depends_on() == {123, 456, 789, 42, 48}

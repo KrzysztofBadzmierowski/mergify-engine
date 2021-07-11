@@ -34,6 +34,8 @@ import tenacity
 
 from mergify_engine import config
 from mergify_engine import context
+from mergify_engine import date
+from mergify_engine import delayed_refresh
 from mergify_engine import engine
 from mergify_engine import exceptions
 from mergify_engine import github_events
@@ -108,23 +110,23 @@ class T_PayloadEvent(typing.TypedDict):
 
 
 @tenacity.retry(
-    wait=tenacity.wait_exponential(multiplier=0.2),
-    stop=tenacity.stop_after_attempt(5),
-    retry=tenacity.retry_if_exception_type(aredis.ConnectionError),
+    wait=tenacity.wait_exponential(multiplier=0.2),  # type: ignore[no-untyped-call]
+    stop=tenacity.stop_after_attempt(5),  # type: ignore[no-untyped-call]
+    retry=tenacity.retry_if_exception_type(aredis.ConnectionError),  # type: ignore[no-untyped-call]
     reraise=True,
 )
 async def push(
     redis: utils.RedisStream,
     owner_id: github_types.GitHubAccountIdType,
     owner: github_types.GitHubLogin,
-    repo_id: typing.Optional[github_types.GitHubRepositoryIdType],
+    repo_id: github_types.GitHubRepositoryIdType,
     repo: github_types.GitHubRepositoryName,
     pull_number: typing.Optional[github_types.GitHubPullRequestNumber],
     event_type: github_types.GitHubEventType,
     data: github_types.GitHubEvent,
 ) -> typing.Tuple[T_MessageID, T_MessagePayload]:
     stream_name = f"stream~{owner}~{owner_id}"
-    scheduled_at = utils.utcnow() + datetime.timedelta(seconds=WORKER_PROCESSING_DELAY)
+    scheduled_at = date.utcnow() + datetime.timedelta(seconds=WORKER_PROCESSING_DELAY)
     score = scheduled_at.timestamp()
     transaction = await redis.pipeline()
     # NOTE(sileht): Add this event to the pull request stream
@@ -165,7 +167,7 @@ async def push(
 
 async def run_engine(
     installation: context.Installation,
-    repo_id: typing.Optional[github_types.GitHubRepositoryIdType],
+    repo_id: github_types.GitHubRepositoryIdType,
     repo_name: github_types.GitHubRepositoryName,
     pull_number: github_types.GitHubPullRequestNumber,
     sources: typing.List[context.T_PayloadEventSource],
@@ -178,18 +180,19 @@ async def run_engine(
     )
     logger.debug("engine in thread start")
     try:
+        started_at = date.utcnow()
         try:
-            if repo_id:
-                repository = installation.get_repository(repo_name, repo_id)
-            else:
-                repository = await installation.get_repository_by_name(repo_name)
-            ctxt = await repository.get_pull_request_context(pull_number)
+            ctxt = await installation.get_pull_request_context(repo_id, pull_number)
         except http.HTTPNotFound:
             # NOTE(sileht): Don't fail if we received even on repo/pull that doesn't exists anymore
             logger.debug("pull request doesn't exists, skipping it")
             return None
 
-        await engine.run(ctxt, sources)
+        result = await engine.run(ctxt, sources)
+        if result is not None:
+            result.started_at = started_at
+            result.ended_at = date.utcnow()
+            await ctxt.set_summary_check(result)
     finally:
         logger.debug("engine in thread end")
 
@@ -199,7 +202,7 @@ PullsToConsume = typing.NewType(
     collections.OrderedDict[
         typing.Tuple[
             github_types.GitHubRepositoryName,
-            typing.Optional[github_types.GitHubRepositoryIdType],
+            github_types.GitHubRepositoryIdType,
             github_types.GitHubPullRequestNumber,
         ],
         typing.Tuple[
@@ -285,7 +288,7 @@ class StreamProcessor:
                 raise IgnoredException()
 
             if isinstance(e, exceptions.RateLimited):
-                retry_at = utils.utcnow() + e.countdown
+                retry_at = date.utcnow() + e.countdown
                 score = retry_at.timestamp()
                 if attempts_key:
                     await self.redis_stream.hdel("attempts", attempts_key)
@@ -303,7 +306,7 @@ class StreamProcessor:
 
             attempts = await self.redis_stream.hincrby("attempts", stream_name)
             retry_in = 3 ** min(attempts, 3) * backoff
-            retry_at = utils.utcnow() + retry_in
+            retry_at = date.utcnow() + retry_in
             score = retry_at.timestamp()
             await self.redis_stream.zaddoption("streams", "XX", **{stream_name: score})
             raise StreamRetry(stream_name, attempts, retry_at)
@@ -331,12 +334,14 @@ class StreamProcessor:
                     owner_id, owner_login, sub, client, self.redis_cache
                 )
                 async with self._translate_exception_to_retries(stream_name):
-                    pulls = await self._extract_pulls_from_stream(installation)
+                    pulls = await self._extract_pulls_from_stream(
+                        stream_name, installation
+                    )
                 if pulls:
                     client.set_requests_ratio(len(pulls))
-                    await self._consume_pulls(installation, pulls)
+                    await self._consume_pulls(stream_name, installation, pulls)
 
-                await self._refresh_merge_trains(installation)
+                await self._refresh_merge_trains(stream_name, installation)
         except aredis.exceptions.ConnectionError:
             statsd.increment("redis.client.connection.errors")
             LOG.warning(
@@ -390,9 +395,11 @@ class StreamProcessor:
             )
         LOG.debug("cleanup stream end", stream_name=stream_name)
 
-    async def _refresh_merge_trains(self, installation):
+    async def _refresh_merge_trains(
+        self, stream_name: StreamNameType, installation: context.Installation
+    ) -> None:
         async with self._translate_exception_to_retries(
-            installation.stream_name,
+            stream_name,
         ):
             async for train in merge_train.Train.iter_trains(installation):
                 await train.load()
@@ -416,19 +423,17 @@ end
 """
 
     async def _extract_pulls_from_stream(
-        self, installation: context.Installation
+        self, stream_name: StreamNameType, installation: context.Installation
     ) -> PullsToConsume:
         messages: typing.List[
             typing.Tuple[T_MessageID, T_MessagePayload]
-        ] = await self.redis_stream.xrange(
-            installation.stream_name, count=config.STREAM_MAX_BATCH
-        )
+        ] = await self.redis_stream.xrange(stream_name, count=config.STREAM_MAX_BATCH)
         LOG.debug(
             "read stream",
-            stream_name=installation.stream_name,
+            stream_name=stream_name,
             messages_count=len(messages),
         )
-        statsd.histogram("engine.streams.size", len(messages))
+        statsd.histogram("engine.streams.size", len(messages))  # type: ignore[no-untyped-call]
         statsd.gauge("engine.streams.max_size", config.STREAM_MAX_BATCH)
 
         # TODO(sileht): Put this cache in Repository context
@@ -442,9 +447,7 @@ end
         for message_id, message in messages:
             data = msgpack.unpackb(message[b"event"], raw=False)
             repo_name = github_types.GitHubRepositoryName(data["repo"])
-            repo_id: typing.Optional[github_types.GitHubRepositoryIdType] = data.get(
-                "repo_id"
-            )
+            repo_id = github_types.GitHubRepositoryIdType(data["repo_id"])
             source = typing.cast(context.T_PayloadEventSource, data["source"])
             if data["pull_number"] is not None:
                 key = (
@@ -486,9 +489,7 @@ end
 
                 logger.debug("event unpacked into %s messages", len(converted_messages))
                 messages.extend(converted_messages)
-                deleted = await self.redis_stream.xdel(
-                    installation.stream_name, message_id
-                )
+                deleted = await self.redis_stream.xdel(stream_name, message_id)
                 if deleted != 1:
                     # FIXME(sileht): During shutdown, heroku may have already started
                     # another worker that have already take the lead of this stream_name
@@ -496,7 +497,7 @@ end
                     # be a big deal as the engine will not been ran by the worker that's
                     # shutdowning.
                     contents = await self.redis_stream.xrange(
-                        installation.stream_name, start=message_id, end=message_id
+                        stream_name, start=message_id, end=message_id
                     )
                     if contents:
                         logger.error(
@@ -511,7 +512,7 @@ end
     async def _convert_event_to_messages(
         self,
         installation: context.Installation,
-        repo_id: typing.Optional[github_types.GitHubRepositoryIdType],
+        repo_id: github_types.GitHubRepositoryIdType,
         repo_name: github_types.GitHubRepositoryName,
         source: context.T_PayloadEventSource,
         pulls: typing.List[github_types.GitHubPullRequest],
@@ -552,18 +553,17 @@ end
 
     async def _consume_pulls(
         self,
+        stream_name: StreamNameType,
         installation: context.Installation,
         pulls: PullsToConsume,
     ) -> None:
-        LOG.debug(
-            "stream contains %d pulls", len(pulls), stream_name=installation.stream_name
-        )
+        LOG.debug("stream contains %d pulls", len(pulls), stream_name=stream_name)
         for (repo, repo_id, pull_number), (message_ids, sources) in pulls.items():
 
-            statsd.histogram("engine.streams.batch-size", len(sources))
+            statsd.histogram("engine.streams.batch-size", len(sources))  # type: ignore[no-untyped-call]
             for source in sources:
                 if "timestamp" in source:
-                    statsd.histogram(
+                    statsd.histogram(  # type: ignore[no-untyped-call]
                         "engine.streams.events.latency",
                         (
                             datetime.datetime.utcnow()
@@ -581,21 +581,21 @@ end
             attempts_key = f"pull~{installation.owner_login}~{repo}~{pull_number}"
             try:
                 async with self._translate_exception_to_retries(
-                    installation.stream_name, attempts_key
+                    stream_name, attempts_key
                 ):
                     await run_engine(installation, repo_id, repo, pull_number, sources)
                 await self.redis_stream.hdel("attempts", attempts_key)
                 await self.redis_stream.execute_command(
-                    "XDEL", installation.stream_name, *message_ids
+                    "XDEL", stream_name, *message_ids
                 )
             except IgnoredException:
                 await self.redis_stream.execute_command(
-                    "XDEL", installation.stream_name, *message_ids
+                    "XDEL", stream_name, *message_ids
                 )
                 logger.debug("failed to process pull request, ignoring", exc_info=True)
             except MaxPullRetry as e:
                 await self.redis_stream.execute_command(
-                    "XDEL", installation.stream_name, *message_ids
+                    "XDEL", stream_name, *message_ids
                 )
                 logger.error(
                     "failed to process pull request, abandoning",
@@ -635,8 +635,10 @@ class Worker:
     process_count: int = config.STREAM_PROCESSES
     process_index: int = dataclasses.field(default_factory=get_process_index_from_env)
     enabled_services: typing.Set[
-        typing.Literal["stream", "stream-monitoring"]
-    ] = dataclasses.field(default_factory=lambda: {"stream", "stream-monitoring"})
+        typing.Literal["stream", "stream-monitoring", "delayed-refresh"]
+    ] = dataclasses.field(
+        default_factory=lambda: {"stream", "stream-monitoring", "delayed-refresh"}
+    )
 
     _redis_stream: typing.Optional[utils.RedisStream] = dataclasses.field(
         init=False, default=None
@@ -667,6 +669,8 @@ class Worker:
         if self._redis_stream is None or self._redis_cache is None:
             raise RuntimeError("redis clients are not ready")
 
+        log_context_token = logs.WORKER_ID.set(worker_id)
+
         # NOTE(sileht): This task must never fail, we don't want to write code to
         # reap/clean/respawn them
         stream_processor = StreamProcessor(self._redis_stream, self._redis_cache)
@@ -680,7 +684,7 @@ class Worker:
                 if stream_name:
                     LOG.debug("worker %s take stream: %s", worker_id, stream_name)
                     try:
-                        with statsd.timed("engine.stream.consume.time"):
+                        with statsd.timed("engine.stream.consume.time"):  # type: ignore[no-untyped-call]
                             await stream_processor.consume(stream_name)
                     finally:
                         LOG.debug(
@@ -703,8 +707,9 @@ class Worker:
                 await self._sleep_or_stop()
 
         LOG.debug("worker %s exited", worker_id)
+        logs.WORKER_ID.reset(log_context_token)
 
-    async def _sleep_or_stop(self, timeout=None):
+    async def _sleep_or_stop(self, timeout: typing.Optional[float] = None) -> None:
         if timeout is None:
             timeout = self.idle_sleep_time
         try:
@@ -729,9 +734,9 @@ class Worker:
                 # based on hash+modulo
                 if len(streams) > self.worker_count:
                     latency = now - streams[self.worker_count][1]
-                    statsd.timing("engine.streams.latency", latency)
+                    statsd.timing("engine.streams.latency", latency)  # type: ignore[no-untyped-call]
                 else:
-                    statsd.timing("engine.streams.latency", 0)
+                    statsd.timing("engine.streams.latency", 0)  # type: ignore[no-untyped-call]
 
                 statsd.gauge("engine.streams.backlog", len(streams))
                 statsd.gauge("engine.workers.count", self.worker_count)
@@ -750,7 +755,25 @@ class Worker:
 
             await self._sleep_or_stop(60)
 
-    def get_worker_ids(self):
+    async def delayed_refresh_task(self) -> None:
+        if self._redis_stream is None or self._redis_cache is None:
+            raise RuntimeError("redis clients are not ready")
+
+        while not self._stopping.is_set():
+            try:
+                await delayed_refresh.send(self._redis_stream, self._redis_cache)
+            except asyncio.CancelledError:
+                LOG.debug("delayed refresh task killed")
+                return
+            except aredis.ConnectionError:
+                statsd.increment("redis.client.connection.errors")
+                LOG.warning("delayed refresh task lost Redis connection", exc_info=True)
+            except Exception:
+                LOG.error("delayed refresh task failed", exc_info=True)
+
+            await self._sleep_or_stop(60)
+
+    def get_worker_ids(self) -> typing.List[int]:
         return list(
             range(
                 self.process_index * self.worker_per_process,
@@ -758,7 +781,7 @@ class Worker:
             )
         )
 
-    async def start(self):
+    async def start(self) -> None:
         self._stopping.clear()
 
         self._redis_stream = utils.create_aredis_for_stream()
@@ -773,16 +796,24 @@ class Worker:
                 )
             LOG.info("workers started", count=len(worker_ids))
 
+        if "delayed-refresh" in self.enabled_services:
+            LOG.info("delayed refresh starting")
+            self._delayed_refresh_task = asyncio.create_task(
+                self.delayed_refresh_task()
+            )
+            LOG.info("delayed refresh started")
+
         if "stream-monitoring" in self.enabled_services:
             LOG.info("monitoring starting")
             self._stream_monitoring_task = asyncio.create_task(self.monitoring_task())
             LOG.info("monitoring started")
 
-    async def _shutdown(self):
+    async def _shutdown(self) -> None:
         tasks = []
-        if "stream" in self.enabled_services:
-            tasks.extend(self._worker_tasks)
-        if "stream-monitoring" in self.enabled_services:
+        tasks.extend(self._worker_tasks)
+        if self._delayed_refresh_task is not None:
+            tasks.append(self._delayed_refresh_task)
+        if self._stream_monitoring_task is not None:
             tasks.append(self._stream_monitoring_task)
 
         LOG.info("workers and monitoring exiting", count=len(tasks))
@@ -811,22 +842,22 @@ class Worker:
 
         LOG.info("shutdown finished")
 
-    def stop(self):
+    def stop(self) -> None:
         self._stopping.set()
         self._stop_task = asyncio.create_task(self._shutdown())
 
-    async def wait_shutdown_complete(self):
+    async def wait_shutdown_complete(self) -> None:
         await self._stopping.wait()
         await self._stop_task
 
-    def stop_with_signal(self, signame):
+    def stop_with_signal(self, signame: str) -> None:
         if not self._stopping.is_set():
             LOG.info("got signal %s: cleanly shutdown workers", signame)
             self.stop()
         else:
             LOG.info("got signal %s: ignoring, shutdown already in process", signame)
 
-    def setup_signals(self):
+    def setup_signals(self) -> None:
         for signame in ("SIGINT", "SIGTERM"):
             self._loop.add_signal_handler(
                 getattr(signal, signame),
@@ -887,7 +918,7 @@ async def async_reschedule_now() -> int:
     expected_stream = f"stream~{args.org.lower()}~"
     for stream in streams:
         if stream.decode().lower().startswith(expected_stream):
-            scheduled_at = utils.utcnow()
+            scheduled_at = date.utcnow()
             score = scheduled_at.timestamp()
             transaction = await redis.pipeline()
             await transaction.hdel("attempts", stream)

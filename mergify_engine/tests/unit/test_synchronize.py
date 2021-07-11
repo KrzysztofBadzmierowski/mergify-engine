@@ -42,6 +42,7 @@ async def test_summary_synchronization_cache(
         {
             "archived": False,
             "url": "",
+            "html_url": "",
             "default_branch": github_types.GitHubRefType(""),
             "id": github_types.GitHubRepositoryIdType(456),
             "full_name": "user/ref",
@@ -72,11 +73,20 @@ async def test_summary_synchronization_cache(
         client,
         redis_cache,
     )
-    repository = context.Repository(installation, gh_repo["name"], gh_repo["id"])
+    repository = context.Repository(installation, gh_repo)
     ctxt = await context.Context.create(
         repository,
         {
+            "locked": False,
+            "assignees": [],
+            "requested_reviewers": [],
+            "requested_teams": [],
+            "milestone": None,
             "title": "",
+            "body": "",
+            "updated_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+            "created_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+            "closed_at": None,
             "id": github_types.GitHubPullRequestId(0),
             "maintainer_can_modify": False,
             "rebaseable": False,
@@ -115,6 +125,7 @@ async def test_summary_synchronization_cache(
                 "repo": {
                     "archived": False,
                     "url": "",
+                    "html_url": "",
                     "default_branch": github_types.GitHubRefType(""),
                     "id": github_types.GitHubRepositoryIdType(123),
                     "full_name": "fork/other",

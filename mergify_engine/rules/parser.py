@@ -13,9 +13,13 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+import datetime
+import re
 import typing
 
 import pyparsing
+
+from mergify_engine import date
 
 
 git_branch = pyparsing.CharsNotIn("~^: []\\")
@@ -30,21 +34,154 @@ text = (
 )
 milestone = pyparsing.CharsNotIn(" ")
 
+_match_time = (
+    pyparsing.Word(pyparsing.nums).addCondition(
+        lambda tokens: int(tokens[0]) >= 0 and int(tokens[0]) < 24
+    )
+    + pyparsing.Literal(":")
+    + pyparsing.Word(pyparsing.nums).addCondition(
+        lambda tokens: int(tokens[0]) >= 0 and int(tokens[0]) < 60
+    )
+).setParseAction(
+    lambda toks: datetime.time(
+        hour=int(toks[0]), minute=int(toks[2]), tzinfo=datetime.timezone.utc
+    )
+)
+
+_day = (
+    pyparsing.Word(pyparsing.nums)
+    .setParseAction(lambda tokens: date.Day(int(tokens[0])))
+    .addCondition(
+        lambda tokens: tokens[0].value >= 1 and tokens[0].value <= 31,
+        message="day must be between 1 and 31",
+    )
+)
+_month = (
+    pyparsing.Word(pyparsing.nums)
+    .setParseAction(lambda tokens: date.Month(int(tokens[0])))
+    .addCondition(
+        lambda tokens: tokens[0].value >= 1 and tokens[0].value <= 12,
+        message="month must be between 1 and 12",
+    )
+)
+_year = (
+    pyparsing.Word(pyparsing.nums)
+    .setParseAction(lambda tokens: date.Year(int(tokens[0])))
+    .addCondition(
+        lambda tokens: tokens[0].value >= 2000 and tokens[0].value <= 9999,
+        message="year must be between 2000 and 9999",
+    )
+)
+_day_of_week_str = (
+    pyparsing.Word(pyparsing.nums)
+    | pyparsing.CaselessLiteral("monday")
+    | pyparsing.CaselessLiteral("tuesday")
+    | pyparsing.CaselessLiteral("wednesday")
+    | pyparsing.CaselessLiteral("thursday")
+    | pyparsing.CaselessLiteral("friday")
+    | pyparsing.CaselessLiteral("saturday")
+    | pyparsing.CaselessLiteral("sunday")
+    | pyparsing.CaselessLiteral("mon")
+    | pyparsing.CaselessLiteral("tue")
+    | pyparsing.CaselessLiteral("wed")
+    | pyparsing.CaselessLiteral("thu")
+    | pyparsing.CaselessLiteral("fri")
+    | pyparsing.CaselessLiteral("sat")
+    | pyparsing.CaselessLiteral("sun")
+)
+_day_of_week = _day_of_week_str.setParseAction(
+    lambda tokens: date.DayOfWeek.from_string(tokens[0])
+).addCondition(
+    lambda tokens: tokens[0].value >= 1 and tokens[0].value <= 7,
+    message="day-of-week must be between 1 and 7",
+)
+
+# PostgreSQL's day-time interval format without seconds and microseconds, e.g. "3 days 04:05"
+_TIMEDELTA_TO_NOW_RE = re.compile(
+    r"^"
+    r"(?:(?P<days>\d+) (days? ?))?"
+    r"(?:"
+    r"(?P<hours>\d+):"
+    r"(?P<minutes>\d\d)"
+    r")? ago$"
+)
+
+
+def _parse_timedelta_to_now(tokens):
+    m = _TIMEDELTA_TO_NOW_RE.match(tokens[0])
+    if m is None:
+        raise pyparsing.ParseException("invalid relative timestamp")
+    kw = m.groupdict()
+    days = datetime.timedelta(float(kw.pop("days", 0) or 0))
+    kw = {k: float(v) for k, v in kw.items() if v is not None}
+    return date.RelativeDatetime(date.utcnow() - (days + datetime.timedelta(**kw)))
+
+
+timedelta_to_now = text.copy().setParseAction(_parse_timedelta_to_now)
+
+
+def _iso_datetime(tokens):
+    try:
+        return date.fromisoformat(tokens[0])
+    except ValueError:
+        raise pyparsing.ParseException("invalid timestamp")
+
+
+iso_datetime = text.copy().setParseAction(_iso_datetime)
+
+_day_of_week_range = (
+    _day_of_week + pyparsing.Literal("-") + _day_of_week
+).setParseAction(
+    lambda toks: {
+        "and": (
+            {">=": ("current-day-of-week", toks[0])},
+            {"<=": ("current-day-of-week", toks[2])},
+        )
+    }
+)
+_time_range = (_match_time + pyparsing.Literal("-") + _match_time).setParseAction(
+    lambda toks: {
+        "and": (
+            {">=": ("current-time", toks[0])},
+            {"<=": ("current-time", toks[2])},
+        )
+    }
+)
+_schedule = (_day_of_week_range + pyparsing.White(" ") + _time_range).setParseAction(
+    lambda toks: {"and": (toks[0], toks[2])}
+)
+_schedule = _schedule | _time_range | _day_of_week_range
+
+
+def convert_equality_to_at(toks):
+    not_ = toks[1] == "!="
+    toks[1] = "@"
+    if not_:
+        return {"-": toks}
+    else:
+        return toks
+
+
 regex_operators = pyparsing.Literal("~=")
 
-simple_operators = (
+
+equality_operators = (
     pyparsing.Literal(":").setParseAction(pyparsing.replaceWith("="))
     | pyparsing.Literal("=")
     | pyparsing.Literal("==").setParseAction(pyparsing.replaceWith("="))
     | pyparsing.Literal("!=")
     | pyparsing.Literal("≠").setParseAction(pyparsing.replaceWith("!="))
-    | pyparsing.Literal(">=")
+)
+
+range_operators = (
+    pyparsing.Literal(">=")
     | pyparsing.Literal("≥").setParseAction(pyparsing.replaceWith(">="))
     | pyparsing.Literal("<=")
     | pyparsing.Literal("≤").setParseAction(pyparsing.replaceWith("<="))
     | pyparsing.Literal("<")
     | pyparsing.Literal(">")
 )
+simple_operators = equality_operators | range_operators
 
 
 def _match_boolean(literal: str) -> pyparsing.Token:
@@ -65,7 +202,19 @@ def _match_with_operator(token: pyparsing.Token) -> pyparsing.Token:
 def _token_to_dict(
     s: str, loc: int, toks: typing.List[pyparsing.Token]
 ) -> typing.Dict[str, typing.Any]:
-    if len(toks) == 5:
+    if len(toks) == 3:
+        # datetime attributes
+        key_op = ""
+        not_ = False
+        key, op, value = toks
+        # NOTE(sileht): We can't just use a timedelta or a datetime at this
+        # point otherwise we will not be able compute the next time the
+        # condition will change, so we use the -relative attribute and
+        # date.RelativeDatetime
+        if isinstance(value, date.RelativeDatetime):
+            key += "-relative"
+
+    elif len(toks) == 5:
         # quantifiable_attributes
         not_, key_op, key, op, value = toks
     elif len(toks) == 4:
@@ -107,8 +256,25 @@ status_success = "status-success" + _match_with_operator(text)
 status_failure = "status-failure" + _match_with_operator(text)
 status_neutral = "status-neutral" + _match_with_operator(text)
 check_success = "check-success" + _match_with_operator(text)
+check_success_or_neutral = "check-success-or-neutral" + _match_with_operator(text)
 check_failure = "check-failure" + _match_with_operator(text)
 check_neutral = "check-neutral" + _match_with_operator(text)
+check_skipped = "check-skipped" + _match_with_operator(text)
+check_pending = "check-pending" + _match_with_operator(text)
+check_stale = "check-stale" + _match_with_operator(text)
+current_time = "current-time" + range_operators + _match_time
+current_day = "current-day" + _match_with_operator(_day)
+current_month = "current-month" + _match_with_operator(_month)
+current_year = "current-year" + _match_with_operator(_year)
+current_day_of_week = "current-day-of-week" + _match_with_operator(_day_of_week)
+schedule = ("schedule" + equality_operators + _schedule).setParseAction(
+    convert_equality_to_at
+)
+created_at = "created-at" + range_operators + (iso_datetime | timedelta_to_now)
+updated_at = "updated-at" + range_operators + (iso_datetime | timedelta_to_now)
+closed_at = "closed-at" + range_operators + (iso_datetime | timedelta_to_now)
+merged_at = "merged-at" + range_operators + (iso_datetime | timedelta_to_now)
+current_timestamp = "current-timestamp" + range_operators + iso_datetime
 
 quantifiable_attributes = (
     head
@@ -132,7 +298,11 @@ quantifiable_attributes = (
     | status_failure
     | check_success
     | check_neutral
+    | check_success_or_neutral
     | check_failure
+    | check_skipped
+    | check_pending
+    | check_stale
 )
 
 locked = _match_boolean("locked")
@@ -143,17 +313,34 @@ draft = _match_boolean("draft")
 
 non_quantifiable_attributes = locked | closed | conflict | draft | merged
 
+datetime_attributes = (
+    current_time
+    | current_day_of_week
+    | current_month
+    | current_year
+    | current_day
+    | schedule
+    | updated_at
+    | created_at
+    | merged_at
+    | closed_at
+    | current_timestamp
+)
+
 search = (
-    pyparsing.Optional(
-        (
-            pyparsing.Literal("-").setParseAction(pyparsing.replaceWith(True))
-            | pyparsing.Literal("¬").setParseAction(pyparsing.replaceWith(True))
-            | pyparsing.Literal("+").setParseAction(pyparsing.replaceWith(False))
-        ),
-        default=False,
-    )
-    + (
-        (pyparsing.Optional("#", default="") + quantifiable_attributes)
-        | non_quantifiable_attributes
+    datetime_attributes
+    | (
+        pyparsing.Optional(
+            (
+                pyparsing.Literal("-").setParseAction(pyparsing.replaceWith(True))
+                | pyparsing.Literal("¬").setParseAction(pyparsing.replaceWith(True))
+                | pyparsing.Literal("+").setParseAction(pyparsing.replaceWith(False))
+            ),
+            default=False,
+        )
+        + (
+            (pyparsing.Optional("#", default="") + quantifiable_attributes)
+            | non_quantifiable_attributes
+        )
     )
 ).setParseAction(_token_to_dict)

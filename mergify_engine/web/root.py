@@ -30,6 +30,7 @@ from mergify_engine import github_events
 from mergify_engine import github_types
 from mergify_engine import json
 from mergify_engine import subscription
+from mergify_engine import user_tokens
 from mergify_engine import utils
 from mergify_engine.clients import github
 from mergify_engine.clients import http
@@ -188,7 +189,7 @@ async def subscription_cache_update(
             redis_cache, int(owner_id), sub
         )
     except NotImplementedError:
-        return responses.Response("updating subscription is disabled", status_code=400)
+        return responses.Response("Updating subscription is disabled", status_code=400)
 
     return responses.Response("Cache updated", status_code=200)
 
@@ -206,7 +207,24 @@ async def subscription_cache_delete(
     try:
         await subscription.Subscription.delete_subscription(redis_cache, owner_id)
     except NotImplementedError:
-        return responses.Response("deleting subscription is disabled", status_code=400)
+        return responses.Response("Deleting subscription is disabled", status_code=400)
+    return responses.Response("Cache cleaned", status_code=200)
+
+
+@app.delete(
+    "/tokens-cache/{owner_id}",  # noqa: FS003
+    dependencies=[fastapi.Depends(auth.signature)],
+)
+async def tokens_cache_delete(
+    owner_id: github_types.GitHubAccountIdType,
+    redis_cache: utils.RedisCache = fastapi.Depends(  # noqa: B008
+        redis.get_redis_cache
+    ),
+) -> responses.Response:
+    try:
+        await user_tokens.UserTokens.delete(redis_cache, owner_id)
+    except NotImplementedError:
+        return responses.Response("Deleting tokens is disabled", status_code=400)
     return responses.Response("Cache cleaned", status_code=200)
 
 

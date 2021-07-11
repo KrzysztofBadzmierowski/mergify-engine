@@ -25,8 +25,10 @@ from mergify_engine import constants
 from mergify_engine import context
 from mergify_engine import queue
 from mergify_engine import rules
+from mergify_engine import signals
 from mergify_engine import subscription
 from mergify_engine.actions import merge_base
+from mergify_engine.actions import utils as action_utils
 from mergify_engine.queue import naive
 from mergify_engine.rules import types
 
@@ -35,7 +37,6 @@ LOG = daiquiri.getLogger(__name__)
 
 
 class MergeAction(merge_base.MergeBaseAction):
-
     validator = {
         voluptuous.Required("method", default="merge"): voluptuous.Any(
             "rebase", "merge", "squash"
@@ -72,33 +73,18 @@ class MergeAction(merge_base.MergeBaseAction):
             {"priority": 0, "speculative_checks": 1}
         )
 
-    def _subscription_status(
+    async def _subscription_status(
         self, ctxt: context.Context
     ) -> typing.Optional[check_api.Result]:
 
-        if self.config["update_bot_account"] and not ctxt.subscription.has_feature(
-            subscription.Features.MERGE_BOT_ACCOUNT
-        ):
-            return check_api.Result(
-                check_api.Conclusion.ACTION_REQUIRED,
-                "Merge with `update_bot_account` set is unavailable",
-                ctxt.subscription.missing_feature_reason(
-                    ctxt.pull["base"]["repo"]["owner"]["login"]
-                ),
-            )
+        if self.config["bot_account"] is not None:
+            if ctxt.subscription.has_feature(subscription.Features.MERGE_BOT_ACCOUNT):
+                ctxt.log.info("legacy bot_account used by paid plan")
 
-        elif self.config["merge_bot_account"] and not ctxt.subscription.has_feature(
-            subscription.Features.MERGE_BOT_ACCOUNT
-        ):
-            return check_api.Result(
-                check_api.Conclusion.ACTION_REQUIRED,
-                "Merge with `merge_bot_account` set is unavailable",
-                ctxt.subscription.missing_feature_reason(
-                    ctxt.pull["base"]["repo"]["owner"]["login"]
-                ),
-            )
+        if self.config["update_bot_account"] is None:
+            self.config["update_bot_account"] = self.config["bot_account"]
 
-        elif self.config[
+        if self.config[
             "priority"
         ] != merge_base.PriorityAliases.medium.value and not ctxt.subscription.has_feature(
             subscription.Features.PRIORITY_QUEUES
@@ -111,12 +97,35 @@ class MergeAction(merge_base.MergeBaseAction):
                 ),
             )
 
+        bot_account_result = await action_utils.validate_bot_account(
+            ctxt,
+            self.config["update_bot_account"],
+            option_name="update_bot_account",
+            required_feature=subscription.Features.MERGE_BOT_ACCOUNT,
+            missing_feature_message="Merge with `update_bot_account` set is unavailable",
+        )
+        if bot_account_result is not None:
+            return bot_account_result
+
+        bot_account_result = await action_utils.validate_bot_account(
+            ctxt,
+            self.config["merge_bot_account"],
+            option_name="merge_bot_account",
+            required_feature=subscription.Features.MERGE_BOT_ACCOUNT,
+            missing_feature_message="Merge with `merge_bot_account` set is unavailable",
+            # NOTE(sileht): we don't allow admin, because if branch protection are
+            # enabled, but not enforced on admins, we may bypass them
+            required_permissions=["write", "maintain"],
+        )
+        if bot_account_result is not None:
+            return bot_account_result
+
         return None
 
     async def run(
         self, ctxt: context.Context, rule: "rules.EvaluatedRule"
     ) -> check_api.Result:
-        subscription_status = self._subscription_status(ctxt)
+        subscription_status = await self._subscription_status(ctxt)
         if subscription_status:
             return subscription_status
         return await super().run(ctxt, rule)
@@ -148,17 +157,25 @@ class MergeAction(merge_base.MergeBaseAction):
         else:
             raise RuntimeError("Unexpected strict")
 
+    async def _should_be_merged_during_cancel(
+        self, ctxt: context.Context, q: queue.QueueBase
+    ) -> bool:
+        # NOTE(sileht): we prefer wait the engine to be retriggered and rerun run()
+        return False
+
     async def _should_be_cancel(
         self, ctxt: context.Context, rule: "rules.EvaluatedRule"
     ) -> bool:
         # It's closed, it's not going to change
-        if ctxt.pull["state"] == "closed":
+        if ctxt.closed:
             return True
 
-        if ctxt.have_been_synchronized():
+        if ctxt.has_been_synchronized():
             return True
 
-        pull_rule_checks_status = await self.get_pull_rule_checks_status(ctxt, rule)
+        pull_rule_checks_status = await merge_base.get_rule_checks_status(
+            ctxt, ctxt.pull_request, rule
+        )
         return pull_rule_checks_status == check_api.Conclusion.FAILURE
 
     async def _get_queue(self, ctxt: context.Context) -> queue.QueueBase:
@@ -167,10 +184,8 @@ class MergeAction(merge_base.MergeBaseAction):
     async def _get_queue_summary(
         self, ctxt: context.Context, rule: "rules.EvaluatedRule", q: queue.QueueBase
     ) -> str:
-        summary = "**Required conditions for merge:**\n"
-        for cond in rule.conditions:
-            checked = " " if cond in rule.missing_conditions else "X"
-            summary += f"\n- [{checked}] `{cond}`"
+        summary = "**Required conditions for merge:**\n\n"
+        summary += rule.conditions.get_summary()
 
         pulls = await q.get_pulls()
         if pulls:
@@ -196,10 +211,24 @@ class MergeAction(merge_base.MergeBaseAction):
                     "|"
                 )
 
-            summary += "\n\n**The following pull requests are queued:**\n" + "\n".join(
-                table
+            summary += (
+                "\n**The following pull requests are queued:**\n"
+                + "\n".join(table)
+                + "\n"
             )
 
-        summary += "\n\n---\n\n"
+        summary += "\n---\n\n"
         summary += constants.MERGIFY_PULL_REQUEST_DOC
         return summary
+
+    async def send_signal(self, ctxt: context.Context) -> None:
+        await signals.send(
+            ctxt,
+            "action.merge",
+            {
+                "merge_bot_account": bool(self.config["merge_bot_account"]),
+                "update_bot_account": bool(self.config["update_bot_account"])
+                or bool(self.config["bot_account"]),
+                "strict": self.config["strict"].value,
+            },
+        )

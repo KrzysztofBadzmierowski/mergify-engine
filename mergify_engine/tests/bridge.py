@@ -29,7 +29,7 @@ from mergify_engine.clients import http
 LOG = logging.getLogger(__name__)
 
 
-async def main():
+async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--dest", default="http://localhost:8802/event")
@@ -47,13 +47,13 @@ async def main():
     ) as session:
 
         if args.clean:
-            r = await session.request("DELETE", "/events-testing", data=payload_data)
+            r = await session.request("DELETE", "/events-testing", content=payload_data)
             r.raise_for_status()
 
         while True:
             try:
                 resp = await session.request(
-                    "GET", "/events-testing", data=payload_data
+                    "GET", "/events-testing", content=payload_data
                 )
                 events = resp.json()
                 for event in reversed(events):
@@ -75,7 +75,7 @@ async def main():
                             "X-Hub-Signature": f"sha1={hmac}",
                             "Content-type": "application/json",
                         },
-                        data=data,
+                        content=data,
                     )
             except Exception:
                 LOG.error("event handling failure", exc_info=True)

@@ -30,8 +30,11 @@ from mergify_engine.rules import InvalidRules
 from mergify_engine.rules import get_mergify_config
 
 
-def pull_request_rule_from_list(lst):
-    return voluptuous.Schema(rules.get_pull_request_rules_schema())(lst)
+def pull_request_rule_from_list(lst: typing.Any) -> rules.PullRequestRules:
+    return typing.cast(
+        rules.PullRequestRules,
+        voluptuous.Schema(rules.get_pull_request_rules_schema())(lst),
+    )
 
 
 def test_valid_condition():
@@ -48,11 +51,88 @@ def test_invalid_condition_re():
     "valid",
     (
         {"name": "hello", "conditions": ["head:master"], "actions": {}},
-        {"name": "hello", "conditions": ["base:foo", "base:baz"], "actions": {}},
+        {"name": "hello", "conditions": ["body:foo", "body:baz"], "actions": {}},
+        {
+            "name": "and",
+            "conditions": [{"and": ["body:foo", "body:baz"]}],
+            "actions": {},
+        },
+        {"name": "or", "conditions": [{"or": ["body:foo", "body:baz"]}], "actions": {}},
+        {
+            "name": "and,or",
+            "conditions": [{"and": ["label=foo", {"or": ["body:foo", "body:baz"]}]}],
+            "actions": {},
+        },
+        {
+            "name": "or,and",
+            "conditions": [{"or": ["label=foo", {"and": ["body:foo", "body:baz"]}]}],
+            "actions": {},
+        },
     ),
 )
 def test_pull_request_rule(valid):
     pull_request_rule_from_list([valid])
+
+
+@pytest.mark.parametrize(
+    "invalid,error",
+    (
+        (
+            {
+                "name": "unknown operator",
+                "conditions": [{"what": ["base:foo", "base:baz"]}],
+                "actions": {},
+            },
+            "extra keys not allowed @ data[0]['conditions'][0]['what']",
+        ),
+        (
+            {
+                "name": "too many nested conditions",
+                "conditions": [
+                    {
+                        "or": [
+                            "label=foo",
+                            {
+                                "and": [
+                                    {
+                                        "or": [
+                                            "base:foo",
+                                            {"and": ["base:baz", "base=main"]},
+                                        ]
+                                    },
+                                    "label=bar",
+                                ]
+                            },
+                        ]
+                    }
+                ],
+                "actions": {},
+            },
+            "Maximun number of nested conditions reached",
+        ),
+        (
+            {
+                "name": "not enought items or",
+                "conditions": [{"or": ["label=foo"]}],
+                "actions": {},
+            },
+            "length of value must be at least 2 for dictionary value @ data[0]['conditions'][0]['or']",
+        ),
+        (
+            {
+                "name": "not enought items and",
+                "conditions": [{"and": []}],
+                "actions": {},
+            },
+            "length of value must be at least 2 for dictionary value @ data[0]['conditions'][0]['and']",
+        ),
+    ),
+)
+def test_invalid_pull_request_rule(invalid, error):
+    with pytest.raises(voluptuous.Invalid) as i:
+        pull_request_rule_from_list([invalid])
+
+    assert error in str(i.value)
 
 
 def test_same_names():
@@ -216,19 +296,43 @@ def test_jinja_with_wrong_syntax():
 )
 @pytest.mark.asyncio
 async def test_get_mergify_config(valid: str, redis_cache: utils.RedisCache) -> None:
-    async def item(*args, **kwargs):
+    async def item(
+        *args: typing.Any, **kwargs: typing.Any
+    ) -> github_types.GitHubContentFile:
         return github_types.GitHubContentFile(
             {
                 "content": encodebytes(valid.encode()).decode(),
                 "path": ".mergify.yml",
                 "type": "file",
-                "sha": "azertyu",
+                "sha": github_types.SHAType("azertyu"),
             }
         )
 
     client = mock.Mock()
     client.item.return_value = item()
 
+    gh_owner = github_types.GitHubAccount(
+        {
+            "login": github_types.GitHubLogin("user"),
+            "id": github_types.GitHubAccountIdType(0),
+            "type": "User",
+            "avatar_url": "",
+        }
+    )
+
+    gh_repo = github_types.GitHubRepository(
+        {
+            "full_name": "user/name",
+            "name": github_types.GitHubRepositoryName("name"),
+            "private": False,
+            "id": github_types.GitHubRepositoryIdType(0),
+            "owner": gh_owner,
+            "archived": False,
+            "url": "",
+            "html_url": "",
+            "default_branch": github_types.GitHubRefType("ref"),
+        }
+    )
     installation = context.Installation(
         github_types.GitHubAccountIdType(0),
         github_types.GitHubLogin("foobar"),
@@ -236,11 +340,7 @@ async def test_get_mergify_config(valid: str, redis_cache: utils.RedisCache) -> 
         client,
         redis_cache,
     )
-    repository = context.Repository(
-        installation,
-        github_types.GitHubRepositoryName("xyz"),
-        github_types.GitHubRepositoryIdType(0),
-    )
+    repository = context.Repository(installation, gh_repo)
 
     config_file = await repository.get_mergify_config_file()
     assert config_file is not None
@@ -269,18 +369,42 @@ pull_request_rules:
       rebase: {}
 """
 
-    async def item(*args, **kwargs):
+    async def item(
+        *args: typing.Any, **kwargs: typing.Any
+    ) -> github_types.GitHubContentFile:
         return github_types.GitHubContentFile(
             {
                 "content": encodebytes(config.encode()).decode(),
                 "path": ".mergify.yml",
                 "type": "file",
-                "sha": "azertyu",
+                "sha": github_types.SHAType("azertyu"),
             }
         )
 
     client = mock.Mock()
     client.item.return_value = item()
+
+    gh_owner = github_types.GitHubAccount(
+        {
+            "login": github_types.GitHubLogin("foobar"),
+            "id": github_types.GitHubAccountIdType(0),
+            "type": "User",
+            "avatar_url": "",
+        }
+    )
+    gh_repo = github_types.GitHubRepository(
+        {
+            "full_name": "foobar/xyz",
+            "name": github_types.GitHubRepositoryName("xyz"),
+            "private": False,
+            "id": github_types.GitHubRepositoryIdType(0),
+            "owner": gh_owner,
+            "archived": False,
+            "url": "",
+            "html_url": "",
+            "default_branch": github_types.GitHubRefType("ref"),
+        }
+    )
 
     installation = context.Installation(
         github_types.GitHubAccountIdType(0),
@@ -289,11 +413,7 @@ pull_request_rules:
         client,
         redis_cache,
     )
-    repository = context.Repository(
-        installation,
-        github_types.GitHubRepositoryName("xyz"),
-        github_types.GitHubRepositoryIdType(0),
-    )
+    repository = context.Repository(installation, gh_repo)
     config_file = await repository.get_mergify_config_file()
     assert config_file is not None
 
@@ -333,11 +453,7 @@ pull_request_rules:
         client,
         redis_cache,
     )
-    repository = context.Repository(
-        installation,
-        github_types.GitHubRepositoryName("xyz"),
-        github_types.GitHubRepositoryIdType(0),
-    )
+    repository = context.Repository(installation, gh_repo)
     config_file = await repository.get_mergify_config_file()
     assert config_file is not None
 
@@ -369,26 +485,43 @@ async def test_get_mergify_config_location_from_cache(
         ),
     ]
 
+    gh_owner = github_types.GitHubAccount(
+        {
+            "login": github_types.GitHubLogin("foobar"),
+            "id": github_types.GitHubAccountIdType(0),
+            "type": "User",
+            "avatar_url": "",
+        }
+    )
+    gh_repo = github_types.GitHubRepository(
+        {
+            "full_name": "foobar/xyz",
+            "name": github_types.GitHubRepositoryName("xyz"),
+            "private": False,
+            "id": github_types.GitHubRepositoryIdType(0),
+            "owner": gh_owner,
+            "archived": False,
+            "url": "",
+            "html_url": "",
+            "default_branch": github_types.GitHubRefType("ref"),
+        }
+    )
     installation = context.Installation(
         github_types.GitHubAccountIdType(0),
-        github_types.GitHubLogin("foo"),
+        github_types.GitHubLogin("foobar"),
         subscription.Subscription(redis_cache, 0, False, "", frozenset()),
         client,
         redis_cache,
     )
-    repository = context.Repository(
-        installation,
-        github_types.GitHubRepositoryName("bar"),
-        github_types.GitHubRepositoryIdType(0),
-    )
+    repository = context.Repository(installation, gh_repo)
 
     await repository.get_mergify_config_file()
     assert client.item.call_count == 3
     client.item.assert_has_calls(
         [
-            mock.call("/repos/foo/bar/contents/.mergify.yml"),
-            mock.call("/repos/foo/bar/contents/.mergify/config.yml"),
-            mock.call("/repos/foo/bar/contents/.github/mergify.yml"),
+            mock.call("/repos/foobar/xyz/contents/.mergify.yml", params={}),
+            mock.call("/repos/foobar/xyz/contents/.mergify/config.yml", params={}),
+            mock.call("/repos/foobar/xyz/contents/.github/mergify.yml", params={}),
         ]
     )
 
@@ -408,7 +541,7 @@ async def test_get_mergify_config_location_from_cache(
     assert client.item.call_count == 1
     client.item.assert_has_calls(
         [
-            mock.call("/repos/foo/bar/contents/.github/mergify.yml"),
+            mock.call("/repos/foobar/xyz/contents/.github/mergify.yml", params={}),
         ]
     )
 
@@ -437,18 +570,42 @@ async def test_get_mergify_config_invalid(
 ) -> None:
     with pytest.raises(InvalidRules):
 
-        async def item(*args, **kwargs):
+        async def item(
+            *args: typing.Any, **kwargs: typing.Any
+        ) -> github_types.GitHubContentFile:
             return github_types.GitHubContentFile(
                 {
                     "content": encodebytes(invalid.encode()).decode(),
                     "path": ".mergify.yml",
                     "type": "file",
-                    "sha": "azertyu",
+                    "sha": github_types.SHAType("azertyu"),
                 }
             )
 
         client = mock.Mock()
         client.item.return_value = item()
+
+        gh_owner = github_types.GitHubAccount(
+            {
+                "login": github_types.GitHubLogin("foobar"),
+                "id": github_types.GitHubAccountIdType(0),
+                "type": "User",
+                "avatar_url": "",
+            }
+        )
+        gh_repo = github_types.GitHubRepository(
+            {
+                "full_name": "foobar/xyz",
+                "name": github_types.GitHubRepositoryName("xyz"),
+                "private": False,
+                "id": github_types.GitHubRepositoryIdType(0),
+                "owner": gh_owner,
+                "archived": False,
+                "url": "",
+                "html_url": "",
+                "default_branch": github_types.GitHubRefType("ref"),
+            }
+        )
         installation = context.Installation(
             github_types.GitHubAccountIdType(0),
             github_types.GitHubLogin("foobar"),
@@ -458,8 +615,7 @@ async def test_get_mergify_config_invalid(
         )
         repository = context.Repository(
             installation,
-            github_types.GitHubRepositoryName("xyz"),
-            github_types.GitHubRepositoryIdType(0),
+            gh_repo,
         )
 
         config_file = await repository.get_mergify_config_file()
@@ -613,7 +769,7 @@ unacceptable character #x0004: special characters are not allowed
         ),
         (
             {"name": "hello", "conditions": [{"foo": "bar"}], "actions": {}},
-            r"expected str @ data\[0\]\['conditions'\]\[0\]",
+            r"extra keys not allowed @ data\[0\]\['conditions'\]\[0\]\['foo'\]",
         ),
         (
             {"name": "hello", "conditions": [], "actions": {}, "foobar": True},
@@ -696,7 +852,16 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
         }
     ]
 
-    client.item = mock.AsyncMock(return_value={"permission": "write"})
+    async def client_item(url, *args, **kwargs):
+        if url == "/repos/another-jd/name/collaborators/sileht/permission":
+            return {"permission": "write"}
+        elif url == "/repos/another-jd/name/collaborators/jd/permission":
+            return {"permission": "write"}
+        elif url == "/repos/another-jd/name/branches/master":
+            return {"protection": {"enabled": False}}
+        raise RuntimeError(f"not handled url {url}")
+
+    client.item.side_effect = client_item
 
     async def client_items(url, *args, **kwargs):
         if url == "/repos/another-jd/name/pulls/1/reviews":
@@ -719,6 +884,27 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
 
     client.items.side_effect = client_items
 
+    gh_owner = github_types.GitHubAccount(
+        {
+            "login": github_types.GitHubLogin("foobar"),
+            "id": github_types.GitHubAccountIdType(0),
+            "type": "User",
+            "avatar_url": "",
+        }
+    )
+    gh_repo = github_types.GitHubRepository(
+        {
+            "full_name": "foobar/name",
+            "name": github_types.GitHubRepositoryName("name"),
+            "private": False,
+            "id": github_types.GitHubRepositoryIdType(0),
+            "owner": gh_owner,
+            "archived": False,
+            "url": "",
+            "html_url": "",
+            "default_branch": github_types.GitHubRefType("ref"),
+        }
+    )
     installation = context.Installation(
         github_types.GitHubAccountIdType(2644),
         github_types.GitHubLogin("another-jd"),
@@ -726,15 +912,16 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
         client,
         redis_cache,
     )
-    repository = context.Repository(
-        installation,
-        github_types.GitHubRepositoryName("name"),
-        github_types.GitHubRepositoryIdType(123321),
-    )
+    repository = context.Repository(installation, gh_repo)
     ctxt = await context.Context.create(
         repository,
         github_types.GitHubPullRequest(
             {
+                "locked": False,
+                "assignees": [],
+                "requested_reviewers": [],
+                "requested_teams": [],
+                "milestone": None,
                 "id": github_types.GitHubPullRequestId(0),
                 "number": github_types.GitHubPullRequestNumber(1),
                 "commits": 1,
@@ -743,6 +930,9 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
                 "maintainer_can_modify": True,
                 "rebaseable": True,
                 "state": "closed",
+                "updated_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+                "created_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+                "closed_at": None,
                 "merged_by": None,
                 "merged_at": None,
                 "merged": False,
@@ -760,6 +950,7 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
                         "private": False,
                         "archived": False,
                         "url": "",
+                        "html_url": "",
                         "default_branch": github_types.GitHubRefType(""),
                         "owner": {
                             "login": github_types.GitHubLogin("another-jd"),
@@ -787,6 +978,7 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
                         "private": False,
                         "archived": False,
                         "url": "",
+                        "html_url": "",
                         "default_branch": github_types.GitHubRefType(""),
                         "owner": {
                             "login": github_types.GitHubLogin("another-jd"),
@@ -803,6 +995,7 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
                     },
                 },
                 "title": "My awesome job",
+                "body": "",
                 "user": {
                     "login": github_types.GitHubLogin("another-jd"),
                     "id": github_types.GitHubAccountIdType(2644),
@@ -815,16 +1008,19 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
 
     # Empty conditions
     pull_request_rules = rules.PullRequestRules(
-        [rules.Rule(name="default", conditions=rules.RuleConditions([]), actions={})]
+        [
+            rules.Rule(
+                name="default",
+                disabled=None,
+                conditions=rules.RuleConditions([]),
+                actions={},
+            )
+        ]
     )
 
     match = await pull_request_rules.get_pull_request_rule(ctxt)
     assert [r.name for r in match.rules] == ["default"]
     assert [r.name for r in match.matching_rules] == ["default"]
-    assert [
-        rules.EvaluatedRule.from_rule(r, rules.RuleMissingConditions([]), [])
-        for r in match.rules
-    ] == match.matching_rules
     for rule in match.rules:
         assert rule.actions == {}
 
@@ -835,10 +1031,6 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     match = await pull_request_rules.get_pull_request_rule(ctxt)
     assert [r.name for r in match.rules] == ["hello"]
     assert [r.name for r in match.matching_rules] == ["hello"]
-    assert [
-        rules.EvaluatedRule.from_rule(r, rules.RuleMissingConditions([]), [])
-        for r in match.rules
-    ] == match.matching_rules
     for rule in match.rules:
         assert rule.actions == {}
 
@@ -852,10 +1044,6 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     match = await pull_request_rules.get_pull_request_rule(ctxt)
     assert [r.name for r in match.rules] == ["hello", "backport"]
     assert [r.name for r in match.matching_rules] == ["hello", "backport"]
-    assert [
-        rules.EvaluatedRule.from_rule(r, rules.RuleMissingConditions([]), [])
-        for r in match.rules
-    ] == match.matching_rules
     for rule in match.rules:
         assert rule.actions == {}
 
@@ -882,10 +1070,6 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     match = await pull_request_rules.get_pull_request_rule(ctxt)
     assert [r.name for r in match.rules] == ["hello", "backport"]
     assert [r.name for r in match.matching_rules] == ["hello", "backport"]
-    assert [
-        rules.EvaluatedRule.from_rule(r, rules.RuleMissingConditions([]), [])
-        for r in match.rules
-    ] == match.matching_rules
     for rule in match.rules:
         assert rule.actions == {}
 
@@ -925,10 +1109,6 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     match = await pull_request_rules.get_pull_request_rule(ctxt)
     assert [r.name for r in match.rules] == ["merge"]
     assert [r.name for r in match.matching_rules] == ["merge"]
-    assert [
-        rules.EvaluatedRule.from_rule(r, rules.RuleMissingConditions([]), [])
-        for r in match.rules
-    ] == match.matching_rules
     for rule in match.rules:
         assert rule.actions == {}
 
@@ -957,7 +1137,17 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
                 "name": "fast merge with alternate ci",
                 "conditions": [
                     "base=master",
-                    "label=fast-track",
+                    {
+                        "or": [
+                            {
+                                "and": [
+                                    "label=automerge",
+                                    "label=ready",
+                                ]
+                            },
+                            "label=fast-track",
+                        ]
+                    },
                     "check-success=continuous-integration/fake-ci-bis",
                     "#approved-reviews-by>=1",
                 ],
@@ -967,6 +1157,12 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
                 "name": "fast merge from a bot",
                 "conditions": [
                     "base=master",
+                    {
+                        "or": [
+                            "label=python-deps",
+                            "label=node-deps",
+                        ]
+                    },
                     "author=mybot",
                     "check-success=continuous-integration/fake-ci",
                 ],
@@ -991,21 +1187,32 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
         assert rule.actions == {}
 
     assert match.matching_rules[0].name == "merge"
-    assert len(match.matching_rules[0].missing_conditions) == 1
-    assert (
-        str(match.matching_rules[0].missing_conditions[0]) == "#approved-reviews-by>=2"
-    )
+    assert not match.matching_rules[0].conditions.match
+    missing_conditions = [
+        c for c in match.matching_rules[0].conditions.walk() if not c.match
+    ]
+    assert len(missing_conditions) == 1
+    assert str(missing_conditions[0]) == "#approved-reviews-by>=2"
 
     assert match.matching_rules[1].name == "fast merge"
-    assert len(match.matching_rules[1].missing_conditions) == 1
-    assert str(match.matching_rules[1].missing_conditions[0]) == "label=fast-track"
+    assert not match.matching_rules[1].conditions.match
+    missing_conditions = [
+        c for c in match.matching_rules[1].conditions.walk() if not c.match
+    ]
+    assert len(missing_conditions) == 1
+    assert str(missing_conditions[0]) == "label=fast-track"
 
     assert match.matching_rules[2].name == "fast merge with alternate ci"
-    assert len(match.matching_rules[2].missing_conditions) == 2
-    assert str(match.matching_rules[2].missing_conditions[0]) == "label=fast-track"
+    assert not match.matching_rules[2].conditions.match
+    missing_conditions = [
+        c for c in match.matching_rules[2].conditions.walk() if not c.match
+    ]
+    assert len(missing_conditions) == 4
+    assert str(missing_conditions[0]) == "label=automerge"
+    assert str(missing_conditions[1]) == "label=ready"
+    assert str(missing_conditions[2]) == "label=fast-track"
     assert (
-        str(match.matching_rules[2].missing_conditions[1])
-        == "check-success=continuous-integration/fake-ci-bis"
+        str(missing_conditions[3]) == "check-success=continuous-integration/fake-ci-bis"
     )
 
     # Team conditions with one review missing
@@ -1027,10 +1234,12 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     assert [r.name for r in match.matching_rules] == ["default"]
 
     assert match.matching_rules[0].name == "default"
-    assert len(match.matching_rules[0].missing_conditions) == 1
-    assert (
-        str(match.matching_rules[0].missing_conditions[0]) == "#approved-reviews-by>=2"
-    )
+    assert not match.matching_rules[0].conditions.match
+    missing_conditions = [
+        c for c in match.matching_rules[0].conditions.walk() if not c.match
+    ]
+    assert len(missing_conditions) == 1
+    assert str(missing_conditions[0]) == "#approved-reviews-by>=2"
 
     get_reviews.append(
         {
@@ -1062,7 +1271,7 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     assert [r.name for r in match.matching_rules] == ["default"]
 
     assert match.matching_rules[0].name == "default"
-    assert len(match.matching_rules[0].missing_conditions) == 0
+    assert match.matching_rules[0].conditions.match
 
     # Forbidden labels, when no label set
     pull_request_rules = pull_request_rule_from_list(
@@ -1079,7 +1288,7 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     assert [r.name for r in match.rules] == ["default"]
     assert [r.name for r in match.matching_rules] == ["default"]
     assert match.matching_rules[0].name == "default"
-    assert len(match.matching_rules[0].missing_conditions) == 0
+    assert match.matching_rules[0].conditions.match
 
     # Forbidden labels, when forbiden label set
     ctxt.pull["labels"] = [
@@ -1090,8 +1299,12 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     assert [r.name for r in match.rules] == ["default"]
     assert [r.name for r in match.matching_rules] == ["default"]
     assert match.matching_rules[0].name == "default"
-    assert len(match.matching_rules[0].missing_conditions) == 1
-    assert str(match.matching_rules[0].missing_conditions[0]) == (
+    assert not match.matching_rules[0].conditions.match
+    missing_conditions = [
+        c for c in match.matching_rules[0].conditions.walk() if not c.match
+    ]
+    assert len(missing_conditions) == 1
+    assert str(missing_conditions[0]) == (
         "-label~=^(status/wip|status/blocked|review/need2)$"
     )
 
@@ -1104,7 +1317,11 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     assert [r.name for r in match.rules] == ["default"]
     assert [r.name for r in match.matching_rules] == ["default"]
     assert match.matching_rules[0].name == "default"
-    assert len(match.matching_rules[0].missing_conditions) == 0
+    assert match.matching_rules[0].conditions.match
+    missing_conditions = [
+        c for c in match.matching_rules[0].conditions.walk() if not c.match
+    ]
+    assert len(missing_conditions) == 0
 
     # Test team expander
     pull_request_rules = pull_request_rule_from_list(
@@ -1120,7 +1337,49 @@ async def test_get_pull_request_rule(redis_cache: utils.RedisCache) -> None:
     assert [r.name for r in match.rules] == ["default"]
     assert [r.name for r in match.matching_rules] == ["default"]
     assert match.matching_rules[0].name == "default"
-    assert len(match.matching_rules[0].missing_conditions) == 0
+    assert match.matching_rules[0].conditions.match
+    missing_conditions = [
+        c for c in match.matching_rules[0].conditions.walk() if not c.match
+    ]
+
+    # branch protection
+    async def client_item_with_branch_protection_enabled(url, *args, **kwargs):
+        if url == "/repos/another-jd/name/branches/master":
+            return {
+                "protection": {
+                    "enabled": True,
+                    "required_status_checks": {"contexts": ["awesome-ci"]},
+                },
+            }
+        raise RuntimeError(f"not handled url {url}")
+
+    client.item.side_effect = client_item_with_branch_protection_enabled
+    del ctxt.repository._cache["branches"]
+    pull_request_rules = pull_request_rule_from_list(
+        [
+            {
+                "name": "default",
+                "conditions": [],
+                "actions": {"merge": {}, "comment": {"message": "yo"}},
+            }
+        ]
+    )
+    match = await pull_request_rules.get_pull_request_rule(ctxt)
+
+    assert [r.name for r in match.rules] == ["default", "default"]
+    assert list(match.matching_rules[0].actions.keys()) == ["merge"]
+    assert len(match.matching_rules[0].conditions.conditions) == 1
+    assert not match.matching_rules[0].conditions.match
+    assert (
+        str(match.matching_rules[0].conditions.conditions[0])
+        == "check-success-or-neutral=awesome-ci"
+    )
+    missing_conditions = [
+        c for c in match.matching_rules[0].conditions.walk() if not c.match
+    ]
+    assert str(missing_conditions[0]) == "check-success-or-neutral=awesome-ci"
+    assert list(match.matching_rules[1].actions.keys()) == ["comment"]
+    assert len(match.matching_rules[1].conditions.conditions) == 0
 
 
 def test_check_runs_custom():
@@ -1361,3 +1620,35 @@ defaults:
     config = rules.get_mergify_config(file)
 
     assert config["pull_request_rules"].rules == []
+
+
+def test_multiple_cascaded_errors():
+    file = context.MergifyConfigFile(
+        type="file",
+        content="whatever",
+        sha="azertyuiop",
+        path="whatever",
+        decoded_content="""
+pull_request_rules:
+  - name: automatic merge for Dependabot pull requests
+    conditions:
+    - author=dependabot[bot]
+      - status-success=Travis CI - Pull Request
+    actions:
+    merge:
+        method: merge
+""",
+    )
+
+    with pytest.raises(rules.InvalidRules) as e:
+        rules.get_mergify_config(file)
+
+    assert (
+        str(e.value)
+        == """* Invalid condition 'author=dependabot[bot] - status-success=Travis CI - Pull Request'. Expected end of text, found '-'  (at char 23), (line:1, col:24) @ pull_request_rules → item 0 → conditions → item 0
+```
+Expected end of text, found '-'  (at char 23), (line:1, col:24)
+```
+* expected a dictionary for dictionary value @ pull_request_rules → item 0 → actions
+* extra keys not allowed @ pull_request_rules → item 0 → merge"""
+    )

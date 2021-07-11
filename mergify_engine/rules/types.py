@@ -57,10 +57,10 @@ class DummyContext(context.Context):
 
 class DummyPullRequest(context.PullRequest):
     # This is only used to check Jinja2 syntax validity and must be sync
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> typing.Any:
         return self.context._get_consolidated_data(name.replace("_", "-"))
 
-    def render_template(self, template, extra_variables=None):
+    def render_template(self, template: str, extra_variables: typing.Optional[typing.Dict[str, str]] = None) -> str:  # type: ignore[override]
         """Render a template interpolating variables based on pull request attributes."""
         env = jinja2.sandbox.SandboxedEnvironment(
             undefined=jinja2.StrictUndefined,
@@ -81,15 +81,24 @@ _DUMMY_PR = DummyPullRequest(
         None,  # type: ignore
         github_types.GitHubPullRequest(
             {
+                "locked": False,
+                "assignees": [],
+                "requested_reviewers": [],
+                "requested_teams": [],
+                "milestone": None,
                 "title": "",
+                "body": "",
                 "number": github_types.GitHubPullRequestNumber(0),
                 "html_url": "",
                 "id": github_types.GitHubPullRequestId(0),
                 "maintainer_can_modify": False,
                 "state": "open",
+                "created_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+                "updated_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
                 "merged": False,
                 "merged_by": None,
                 "merged_at": None,
+                "closed_at": None,
                 "draft": False,
                 "merge_commit_sha": None,
                 "commits": 0,
@@ -115,6 +124,7 @@ _DUMMY_PR = DummyPullRequest(
                     "sha": github_types.SHAType(""),
                     "repo": {
                         "url": "",
+                        "html_url": "",
                         "default_branch": github_types.GitHubRefType(""),
                         "full_name": "",
                         "archived": False,
@@ -141,6 +151,7 @@ _DUMMY_PR = DummyPullRequest(
                     "sha": github_types.SHAType(""),
                     "repo": {
                         "url": "",
+                        "html_url": "",
                         "default_branch": github_types.GitHubRefType(""),
                         "full_name": "",
                         "archived": False,
@@ -163,11 +174,14 @@ _DUMMY_PR = DummyPullRequest(
 
 
 def Jinja2(
-    value: str, extra_variables: typing.Optional[typing.Dict[str, typing.Any]] = None
+    value: typing.Optional[typing.Any],
+    extra_variables: typing.Optional[typing.Dict[str, typing.Any]] = None,
 ) -> typing.Optional[str]:
     """A Jinja2 type for voluptuous Schemas."""
     if value is None:
         raise voluptuous.Invalid("Template cannot be null")
+    if not isinstance(value, str):
+        raise voluptuous.Invalid("Template must be a string")
     try:
         # TODO: optimize this by returning, storing and using the parsed Jinja2 AST
         _DUMMY_PR.render_template(value, extra_variables)

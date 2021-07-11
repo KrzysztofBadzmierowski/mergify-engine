@@ -22,6 +22,7 @@ from mergify_engine import context
 from mergify_engine import rules
 from mergify_engine import signals
 from mergify_engine import subscription
+from mergify_engine.actions import utils as action_utils
 from mergify_engine.clients import http
 from mergify_engine.rules import types
 
@@ -43,16 +44,15 @@ class CommentAction(actions.Action):
                 check_api.Conclusion.SUCCESS, "Message is not set", ""
             )
 
-        if self.config["bot_account"] and not ctxt.subscription.has_feature(
-            subscription.Features.BOT_ACCOUNT
-        ):
-            return check_api.Result(
-                check_api.Conclusion.ACTION_REQUIRED,
-                "Comments with `bot_account` set are disabled",
-                ctxt.subscription.missing_feature_reason(
-                    ctxt.pull["base"]["repo"]["owner"]["login"]
-                ),
-            )
+        bot_account_result = await action_utils.validate_bot_account(
+            ctxt,
+            self.config["bot_account"],
+            required_feature=subscription.Features.BOT_ACCOUNT,
+            missing_feature_message="Comments with `bot_account` set are disabled",
+            required_permissions=[],
+        )
+        if bot_account_result is not None:
+            return bot_account_result
 
         try:
             message = await ctxt.pull_request.render_template(self.config["message"])
@@ -65,20 +65,20 @@ class CommentAction(actions.Action):
 
         if bot_account := self.config["bot_account"]:
             user_tokens = await ctxt.repository.installation.get_user_tokens()
-            oauth_token = user_tokens.get_token_for(bot_account)
-            if not oauth_token:
+            github_user = user_tokens.get_token_for(bot_account)
+            if not github_user:
                 return check_api.Result(
                     check_api.Conclusion.FAILURE,
                     f"Unable to comment: user `{bot_account}` is unknown. ",
                     f"Please make sure `{bot_account}` has logged in Mergify dashboard.",
                 )
         else:
-            oauth_token = None
+            github_user = None
 
         try:
             await ctxt.client.post(
                 f"{ctxt.base_url}/issues/{ctxt.pull['number']}/comments",
-                oauth_token=oauth_token,  # type: ignore
+                oauth_token=github_user["oauth_access_token"] if github_user else None,
                 json={"body": message},
             )
         except http.HTTPClientSideError as e:  # pragma: no cover
@@ -87,5 +87,7 @@ class CommentAction(actions.Action):
                 "Unable to post comment",
                 f"GitHub error: [{e.status_code}] `{e.message}`",
             )
-        await signals.send(ctxt, "action.comment")
+        await signals.send(
+            ctxt, "action.comment", {"bot_account": bool(self.config["bot_account"])}
+        )
         return check_api.Result(check_api.Conclusion.SUCCESS, "Comment posted", message)

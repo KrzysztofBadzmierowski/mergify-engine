@@ -18,6 +18,8 @@ be validated before merging the pull request.
 
 .. _`branch protection`: https://docs.github.com/en/github/administering-a-repository/about-protected-branches
 
+Mergify also waits for dependent pull requests to get merged first (see :ref:`queue-depends-on`).
+
 Options
 -------
 
@@ -44,7 +46,8 @@ Options
    * - ``strict``
      - Boolean, ``smart`` or ``smart+fasttrack``
      - ``false``
-     - Determines whether to use :ref:`strict merge`:
+     - |deprecated tag|
+       Determines whether to use :ref:`strict merge`:
 
        * ``true`` enables :ref:`strict merge`. The pull request will be merged
          only once up-to-date with its base branch. When multiple pull requests
@@ -69,7 +72,8 @@ Options
    * - ``strict_method``
      - string
      - ``merge``
-     - Method to use to update the pull request with its base branch
+     - |deprecated tag|
+       Method to use to update the pull request with its base branch
        when :ref:`strict merge` is enabled. Possible values:
 
        * ``merge`` to merge the base branch into the pull request.
@@ -100,6 +104,7 @@ Options
      - 1 <= integer <= 10000 or ``low`` or ``medium`` or ``high``
      - ``medium``
      - |premium plan tag|
+       |deprecated tag|
        This sets the priority of the pull request in the queue when ``smart``
        :ref:`strict merge` is enabled. The pull request with the highest priority is merged first.
        ``low``, ``medium``, ``high`` are aliases for ``1000``, ``2000``, ``3000``.
@@ -116,6 +121,35 @@ Options
        * ``title+body`` means to use the title and body from the pull request
          itself as the commit message. The pull request number will be added to
          end of the title.
+
+.. _queue-depends-on:
+
+⛓️ Defining Pull Request Dependencies
+-------------------------------------
+
+|premium plan tag|
+|open source plan tag|
+
+You can specify dependencies between pull requests from the same repository.
+Mergify waits for the linked pull requests to be merged before merging any pull
+request with a ``Depends-On:`` header.
+
+To use this feature, adds the ``Depends-On:`` header to the body of your pull
+request:
+
+.. code-block:: md
+
+    New awesome feature 🎉
+
+    To get the full picture, you may need to look at these pull requests:
+
+    Depends-On: #42
+    Depends-On: https://github.com/organization/repository/pull/123
+
+.. warning::
+
+    This feature does not work for cross-repository dependencies.
+
 
 .. _commit message:
 
@@ -169,11 +203,13 @@ Check the :ref:`data type template` for more details on the format.
 Strict Merge
 ------------
 
-.. tip::
+|deprecated tag|
 
-   While `strict merge` solves most issues, the :ref:`queue action <queue
-   action>` and its :ref:`queue rules <queue rules>` provide a more powerful
-   solution and offer total control of the merge queue.
+.. warning::
+
+   `strict merge` has been deprecated. The :ref:`queue action <queue action>`
+   and its :ref:`queue rules <queue rules>` provide a more powerful solution
+   and offer total control of the merge queue.
 
 The `strict merge` option enables a simple merge queue that prevents merging
 broken pull requests. That situation can arise when outdated pull requests are
@@ -238,136 +274,5 @@ Using the ``rebase`` method for the strict merge has many drawbacks:
   token from one of your repository member and uses it to force-push the
   rebased branch. The GitHub UI will show your collaborator as the author of
   the push, while it actually has been executed by Mergify.
-
-
-Git merge workflow and Mergify equivalent configuration
--------------------------------------------------------
-
-.. note::
-
-   `base branch` is usually ``master``, ``main`` or ``dev``,
-   `head branch` is the pull request branch.
-
-
-There is a lot of different ways to merge pull requests. You can replicate many
-``git`` based merge when using Mergify — here's a list of equivalence.
-
-
-.. list-table::
-   :header-rows: 1
-   :widths: 2 2
-
-   * - Git merge workflow
-     - Mergify configuration
-
-   * - ::
-
-         (on head branch) $ git merge --no-ff base
-
-     - ::
-
-         merge:
-           method: merge
-
-   * - ::
-
-         (on head branch) $ git merge --no-ff base
-         (on head branch) # Wait for CI to go green
-         (on base branch) $ git merge --no-ff head
-
-     - ::
-
-         merge:
-           strict: true
-           method: merge
-
-   * - ::
-
-         (on head branch) $ git rebase base
-         (on base branch) $ git merge --ff head
-
-     - ::
-
-         merge:
-           method: rebase
-
-   * - ::
-
-         (on head branch) $ git merge --no-ff base
-         (on head branch) # Wait for CI to go green
-         (on head branch) $ git rebase base
-         (on base branch) $ git merge --ff head
-
-     - ::
-
-         merge:
-           strict: true
-           method: rebase
-
-   * - ::
-
-         (on head branch) $ git rebase base
-         (on head branch) # Wait for CI to go green
-         (on base branch) $ git merge --no-ff head
-
-     - ::
-
-         merge:
-           strict: true
-           strict_method: rebase
-           method: merge
-
-   * - ::
-
-        (on head branch) # Squash all commits
-        (on base branch) $ git merge --ff head
-
-     - ::
-
-         merge:
-           method: squash
-
-   * - ::
-
-         (on head branch) $ git merge --no-ff base
-         (on head branch) # Wait for CI to go green
-         (on head branch) # Squash all commits
-         (on base branch) $ git merge --ff head
-
-     - ::
-
-         merge:
-           strict: true
-           method: squash
-
-   * - ::
-
-         (on head branch) $ git rebase base
-         (on head branch) # Wait for CI to go green
-         (on head branch) # Squash all commits
-         (on base branch) $ git merge --ff head
-
-     - ::
-
-         merge:
-           strict: true
-           strict_method: rebase
-           method: squash
-
-   * - ::
-
-         (on head branch) $ git rebase base
-         (on head branch) # Squash all commits
-         (on head branch) # Mergify wait for CI
-         (on head branch) $ git merge --no-ff head
-
-     - ::
-
-         merge:
-           strict: true
-           strict_method: squash
-           method: merge
-
-       `(not yet implemented)`
 
 .. include:: ../global-substitutions.rst

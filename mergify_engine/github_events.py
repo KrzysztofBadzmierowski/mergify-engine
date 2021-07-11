@@ -53,7 +53,13 @@ def meter_event(
 
 
 def _extract_slim_event(event_type, data):
-    slim_data = {"sender": data["sender"]}
+    slim_data = {
+        "sender": {
+            "id": data["sender"]["id"],
+            "login": data["sender"]["login"],
+            "type": data["sender"]["type"],
+        }
+    }
 
     if event_type == "status":
         # To get PR from sha
@@ -87,8 +93,11 @@ def _extract_slim_event(event_type, data):
         }
 
     elif event_type == "pull_request":
-        # For pull_request opened/synchronise/closed
+        # For pull_request opened/synchronize/closed
         slim_data["action"] = data["action"]
+        if slim_data["action"] == "synchronize":
+            slim_data["before"] = data["before"]
+            slim_data["after"] = data["after"]
 
     elif event_type == "issue_comment":
         # For commands runner
@@ -391,7 +400,7 @@ async def filter_and_dispatch(
 
     if ignore_reason is None:
         msg_action = "pushed to worker"
-        slim_event = _extract_slim_event(event_type, event)
+        slim_event = _extract_slim_event(event_type, event)  # type: ignore[no-untyped-call]
 
         await worker.push(
             redis_stream,
@@ -404,6 +413,7 @@ async def filter_and_dispatch(
             slim_event,
         )
     else:
+        slim_event = None
         msg_action = f"ignored: {ignore_reason}"
 
     LOG.info(
@@ -414,6 +424,7 @@ async def filter_and_dispatch(
         sender=event["sender"]["login"],
         gh_owner=owner_login,
         gh_repo=repo_name,
+        event=slim_event,
     )
 
     if ignore_reason:

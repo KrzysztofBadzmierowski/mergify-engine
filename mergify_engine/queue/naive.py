@@ -17,11 +17,11 @@ import typing
 import daiquiri
 
 from mergify_engine import context
+from mergify_engine import date
 from mergify_engine import github_types
 from mergify_engine import json
 from mergify_engine import queue
 from mergify_engine import rules
-from mergify_engine import utils
 
 
 LOG = daiquiri.getLogger(__name__)
@@ -43,12 +43,12 @@ class Queue(queue.QueueBase):
     def _get_redis_queue_key_for(
         self, ref: typing.Union[github_types.GitHubRefType, typing.Literal["*"]]
     ) -> str:
-        return f"merge-queue~{self.repository.installation.owner_id}~{self.repository.id}~{ref}"
+        return f"merge-queue~{self.repository.installation.owner_id}~{self.repository.repo['id']}~{ref}"
 
     def _config_redis_queue_key(
         self, pull_number: github_types.GitHubPullRequestNumber
     ) -> str:
-        return f"merge-config~{self.repository.installation.owner_id}~{self.repository.id}~{pull_number}"
+        return f"merge-config~{self.repository.installation.owner_id}~{self.repository.repo['id']}~{pull_number}"
 
     async def get_config(
         self, pull_number: github_types.GitHubPullRequestNumber
@@ -94,7 +94,7 @@ class Queue(queue.QueueBase):
                 json.dumps(config),
             )
 
-            score = utils.utcnow().timestamp() / config["effective_priority"]
+            score = date.utcnow().timestamp() / config["effective_priority"]
             await pipeline.zaddoption(
                 self._redis_queue_key, "NX", **{str(ctxt.pull["number"]): score}
             )

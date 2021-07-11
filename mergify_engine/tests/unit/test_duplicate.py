@@ -13,6 +13,7 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+import typing
 from unittest import mock
 
 import pytest
@@ -54,6 +55,29 @@ async def test_get_commits_to_cherry_pick_rebase(
     commits: mock.PropertyMock,
     redis_cache: utils.RedisCache,
 ) -> None:
+    gh_owner = github_types.GitHubAccount(
+        {
+            "login": github_types.GitHubLogin("user"),
+            "id": github_types.GitHubAccountIdType(0),
+            "type": "User",
+            "avatar_url": "",
+        }
+    )
+
+    gh_repo = github_types.GitHubRepository(
+        {
+            "full_name": "user/name",
+            "name": github_types.GitHubRepositoryName("name"),
+            "private": False,
+            "id": github_types.GitHubRepositoryIdType(0),
+            "owner": gh_owner,
+            "archived": False,
+            "url": "",
+            "html_url": "",
+            "default_branch": github_types.GitHubRefType("ref"),
+        }
+    )
+
     c1 = github_types.GitHubBranchCommit(
         {
             "sha": github_types.SHAType("c1f"),
@@ -81,18 +105,23 @@ async def test_get_commits_to_cherry_pick_rebase(
         client,
         redis_cache,
     )
-    repository = context.Repository(
-        installation,
-        github_types.GitHubRepositoryName("name"),
-        github_types.GitHubRepositoryIdType(0),
-    )
+    repository = context.Repository(installation, gh_repo)
     ctxt = await context.Context.create(
         repository,
         {
+            "locked": False,
+            "assignees": [],
+            "requested_reviewers": [],
+            "requested_teams": [],
+            "milestone": None,
             "labels": [],
             "draft": False,
             "merge_commit_sha": github_types.SHAType(""),
             "title": "",
+            "body": "",
+            "updated_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+            "created_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+            "closed_at": None,
             "commits": 1,
             "rebaseable": False,
             "maintainer_can_modify": False,
@@ -125,6 +154,7 @@ async def test_get_commits_to_cherry_pick_rebase(
                     },
                     "archived": False,
                     "url": "",
+                    "html_url": "",
                     "default_branch": github_types.GitHubRefType(""),
                 },
             },
@@ -144,6 +174,7 @@ async def test_get_commits_to_cherry_pick_rebase(
                     "private": False,
                     "archived": False,
                     "url": "",
+                    "html_url": "",
                     "default_branch": github_types.GitHubRefType(""),
                     "id": github_types.GitHubRepositoryIdType(0),
                     "owner": {
@@ -223,7 +254,7 @@ async def test_get_commits_to_cherry_pick_merge(
         }
     )
 
-    async def fake_commits():
+    async def fake_commits() -> typing.List[github_types.GitHubBranchCommit]:
         return [c1, c2]
 
     commits.return_value = fake_commits()
@@ -239,6 +270,19 @@ async def test_get_commits_to_cherry_pick_merge(
             "avatar_url": "",
         }
     )
+    gh_repo = github_types.GitHubRepository(
+        {
+            "full_name": "user/name",
+            "name": github_types.GitHubRepositoryName("name"),
+            "private": False,
+            "id": github_types.GitHubRepositoryIdType(0),
+            "owner": gh_owner,
+            "archived": False,
+            "url": "",
+            "html_url": "",
+            "default_branch": github_types.GitHubRefType("ref"),
+        }
+    )
 
     installation = context.Installation(
         github_types.GitHubAccountIdType(123),
@@ -247,14 +291,15 @@ async def test_get_commits_to_cherry_pick_merge(
         client,
         redis_cache,
     )
-    repository = context.Repository(
-        installation,
-        github_types.GitHubRepositoryName("name"),
-        github_types.GitHubRepositoryIdType(0),
-    )
+    repository = context.Repository(installation, gh_repo)
     ctxt = await context.Context.create(
         repository,
         {
+            "locked": False,
+            "assignees": [],
+            "requested_reviewers": [],
+            "requested_teams": [],
+            "milestone": None,
             "number": github_types.GitHubPullRequestNumber(6),
             "commits": 1,
             "merged": True,
@@ -267,6 +312,10 @@ async def test_get_commits_to_cherry_pick_merge(
             "draft": True,
             "merge_commit_sha": None,
             "title": "foobar",
+            "body": "",
+            "updated_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+            "created_at": github_types.ISODateTimeType("2021-06-01T18:41:39Z"),
+            "closed_at": None,
             "changed_files": 1,
             "base": {
                 "label": "user:ref",
@@ -282,6 +331,7 @@ async def test_get_commits_to_cherry_pick_merge(
                         "owner": gh_owner,
                         "archived": False,
                         "url": "",
+                        "html_url": "",
                         "default_branch": github_types.GitHubRefType("ref"),
                     }
                 ),
@@ -300,6 +350,7 @@ async def test_get_commits_to_cherry_pick_merge(
                         "owner": gh_owner,
                         "archived": False,
                         "url": "",
+                        "html_url": "",
                         "default_branch": github_types.GitHubRefType("ref"),
                     }
                 ),

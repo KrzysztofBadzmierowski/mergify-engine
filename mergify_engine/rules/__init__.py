@@ -1,6 +1,6 @@
 # -*- encoding: utf-8 -*-
 #
-# Copyright © 2018-2020 Mergify SAS
+# Copyright © 2018-2021 Mergify SAS
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -17,6 +17,7 @@ import dataclasses
 import functools
 import itertools
 import operator
+import textwrap
 import typing
 
 import daiquiri
@@ -25,44 +26,279 @@ import yaml
 
 from mergify_engine import actions
 from mergify_engine import context
+from mergify_engine import github_types
+from mergify_engine.clients import http
 from mergify_engine.rules import filter
 from mergify_engine.rules import live_resolvers
+from mergify_engine.rules import parser
 from mergify_engine.rules import types
 
 
 LOG = daiquiri.getLogger(__name__)
 
 
-def RuleCondition(value: str) -> filter.Filter:
-    try:
-        return filter.Filter.parse(value)
-    except filter.parser.pyparsing.ParseException as e:
-        raise voluptuous.Invalid(
-            message=f"Invalid condition '{value}'. {str(e)}", error_message=str(e)
-        )
-    except filter.InvalidQuery as e:
-        raise voluptuous.Invalid(
-            message=f"Invalid condition '{value}'. {str(e)}", error_message=str(e)
-        )
+# This helps mypy breaking the recursive definition
+FakeTreeT = typing.Dict[str, typing.Any]
 
 
-RuleConditions = typing.NewType("RuleConditions", typing.List[filter.Filter])
-RuleMissingConditions = typing.NewType(
-    "RuleMissingConditions", typing.List[filter.Filter]
-)
+@dataclasses.dataclass
+class RuleCondition:
+    """This describe a leaf of the `conditions:` tree, eg:
+
+    label=foobar
+    -merged
+    """
+
+    condition: typing.Union[str, FakeTreeT]
+    description: typing.Optional[str] = None
+    partial_filter: filter.Filter[bool] = dataclasses.field(init=False)
+    match: bool = dataclasses.field(init=False, default=False)
+    _used: bool = dataclasses.field(init=False, default=False)
+    evaluation_error: typing.Optional[str] = dataclasses.field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        self.update(self.condition)
+
+    def update(self, condition_raw: typing.Union[str, FakeTreeT]) -> None:
+        try:
+            if isinstance(condition_raw, str):
+                condition = parser.search.parseString(condition_raw, parseAll=True)[0]
+            else:
+                condition = condition_raw
+            self.partial_filter = filter.BinaryFilter(
+                typing.cast(filter.TreeT, condition)
+            )
+        except (parser.pyparsing.ParseException, filter.InvalidQuery) as e:
+            raise voluptuous.Invalid(
+                message=f"Invalid condition '{condition_raw}'. {str(e)}",
+                error_message=str(e),
+            )
+
+    def update_attribute_name(self, new_name: str) -> None:
+        tree = typing.cast(filter.TreeT, self.partial_filter.tree)
+        negate = "-" in tree
+        tree = tree.get("-", tree)
+        operator = list(tree.keys())[0]
+        name, value = list(tree.values())[0]
+        if name.startswith(filter.Filter.LENGTH_OPERATOR):
+            new_name = f"{filter.Filter.LENGTH_OPERATOR}{new_name}"
+
+        new_tree: FakeTreeT = {operator: (new_name, value)}
+        if negate:
+            new_tree = {"-": new_tree}
+        self.update(new_tree)
+
+    def __str__(self) -> str:
+        if isinstance(self.condition, str):
+            return self.condition
+        else:
+            return str(self.partial_filter)
+
+    def copy(self) -> "RuleCondition":
+        return RuleCondition(self.condition, self.description)
+
+    async def __call__(self, obj: filter.GetAttrObjectT) -> bool:
+        if self._used:
+            raise RuntimeError("RuleCondition cannot be reused")
+        self._used = True
+        try:
+            self.match = await self.partial_filter(obj)
+        except live_resolvers.LiveResolutionFailure as e:
+            self.match = False
+            self.evaluation_error = e.reason
+        return self.match
+
+    def get_attribute_name(self) -> str:
+        tree = typing.cast(filter.TreeT, self.partial_filter.tree)
+        tree = tree.get("-", tree)
+        name = list(tree.values())[0][0]
+        if name.startswith(filter.Filter.LENGTH_OPERATOR):
+            return str(name[1:])
+        return str(name)
+
+
+@dataclasses.dataclass
+class RuleConditionGroup:
+    """This describe a group leafs of the `conditions:` tree linked by and or or."""
+
+    condition: dataclasses.InitVar[
+        typing.Dict[
+            typing.Literal["and", "or"],
+            typing.List[typing.Union["RuleConditionGroup", RuleCondition]],
+        ]
+    ]
+    operator: typing.Literal["and", "or"] = dataclasses.field(init=False)
+    conditions: typing.List[
+        typing.Union["RuleConditionGroup", RuleCondition]
+    ] = dataclasses.field(init=False)
+    match: bool = dataclasses.field(init=False, default=False)
+    _used: bool = dataclasses.field(init=False, default=False)
+
+    def __post_init__(
+        self,
+        condition: typing.Dict[
+            typing.Literal["and", "or"],
+            typing.List[typing.Union["RuleConditionGroup", RuleCondition]],
+        ],
+    ) -> None:
+        if len(condition) != 1:
+            raise RuntimeError("Invalid condition")
+
+        self.operator, self.conditions = next(iter(condition.items()))
+
+    async def __call__(self, obj: filter.GetAttrObjectT) -> bool:
+        if self._used:
+            raise RuntimeError("RuleConditionGroup cannot be re-used")
+        self._used = True
+        self.match = await filter.BinaryFilter(
+            typing.cast(filter.TreeT, {self.operator: self.conditions})
+        )(obj)
+        return self.match
+
+    def extract_raw_filter_tree(
+        self,
+        condition: typing.Optional[
+            typing.Union["RuleConditionGroup", RuleCondition]
+        ] = None,
+    ) -> filter.TreeT:
+        if condition is None:
+            condition = self
+
+        if isinstance(condition, RuleCondition):
+            return typing.cast(filter.TreeT, condition.partial_filter.tree)
+        elif isinstance(condition, RuleConditionGroup):
+            return typing.cast(
+                filter.TreeT,
+                {
+                    condition.operator: [
+                        self.extract_raw_filter_tree(c) for c in condition.conditions
+                    ]
+                },
+            )
+        else:
+            raise RuntimeError("unexpected condition instance")
+
+    def walk(
+        self,
+        conditions: typing.Optional[
+            typing.List[typing.Union["RuleConditionGroup", RuleCondition]]
+        ] = None,
+    ) -> typing.Iterator[RuleCondition]:
+        if conditions is None:
+            conditions = self.conditions
+        for condition in conditions:
+            if isinstance(condition, RuleCondition):
+                yield condition
+            elif isinstance(condition, RuleConditionGroup):
+                for _condition in self.walk(condition.conditions):
+                    yield _condition
+            else:
+                raise RuntimeError(f"Unsupported condition type: {type(condition)}")
+
+    def is_faulty(self) -> bool:
+        return any(c.evaluation_error for c in self.walk())
+
+    def copy(self) -> "RuleConditionGroup":
+        return RuleConditionGroup(
+            {self.operator: [c.copy() for c in self.conditions]},
+        )
+
+    @staticmethod
+    def _get_rule_condition_summary(cond: RuleCondition) -> str:
+        summary = ""
+        checked = "X" if cond.match else " "
+        summary += f"- [{checked}] `{cond}`"
+        if cond.description:
+            summary += f" [{cond.description}]"
+        if cond.evaluation_error:
+            summary += f" ⚠️ {cond.evaluation_error}"
+        summary += "\n"
+        return summary
+
+    @classmethod
+    def _walk_for_summary(
+        cls,
+        conditions: typing.List[typing.Union["RuleConditionGroup", RuleCondition]],
+        level: int = 0,
+    ) -> str:
+        summary = ""
+        for condition in conditions:
+            if isinstance(condition, RuleCondition):
+                summary += cls._get_rule_condition_summary(condition)
+            elif isinstance(condition, RuleConditionGroup):
+                label = "all of" if condition.operator == "and" else "any of"
+                checked = "X" if condition.match else " "
+                summary += f"- [{checked}] {label}:\n"
+                for _sum in cls._walk_for_summary(condition.conditions, level + 1):
+                    summary += _sum
+            else:
+                raise RuntimeError(f"Unsupported condition type: {type(condition)}")
+
+        return textwrap.indent(summary, "  " * level)
+
+    def get_summary(self) -> str:
+        return self._walk_for_summary(self.conditions)
+
+
+def RuleConditions(
+    conditions: typing.List[typing.Union["RuleConditionGroup", RuleCondition]]
+) -> RuleConditionGroup:
+    return RuleConditionGroup({"and": conditions})
+
+
+async def get_branch_protection_conditions(
+    ctxt: context.Context,
+) -> typing.List[typing.Union["RuleConditionGroup", RuleCondition]]:
+    return [
+        RuleCondition(
+            f"check-success-or-neutral={check}",
+            description="🛡 GitHub branch protection",
+        )
+        for check in await ctxt.repository.get_branch_protection_checks(
+            ctxt.pull["base"]["ref"]
+        )
+    ]
+
+
+async def get_depends_on_conditions(
+    ctxt: context.Context,
+) -> typing.List[typing.Union["RuleConditionGroup", RuleCondition]]:
+    conds: typing.List[typing.Union["RuleConditionGroup", RuleCondition]] = []
+    for pull_request_number in ctxt.get_depends_on():
+        try:
+            dep_ctxt = await ctxt.repository.get_pull_request_context(
+                pull_request_number
+            )
+        except http.HTTPNotFound:
+            description = f"⛓️ ⚠️ *pull request not found* (#{pull_request_number})"
+        else:
+            description = f"⛓️ **{dep_ctxt.pull['title']}** ([#{pull_request_number}]({dep_ctxt.pull['html_url']}))"
+        conds.append(
+            RuleCondition(
+                {"=": ("depends-on", f"#{pull_request_number}")},
+                description=description,
+            )
+        )
+    return conds
+
+
+class DisabledDict(typing.TypedDict):
+    reason: str
 
 
 # TODO(sileht): rename me PullRequestRule ?
 @dataclasses.dataclass
 class Rule:
     name: str
-    conditions: RuleConditions
+    disabled: typing.Union[DisabledDict, None]
+    conditions: RuleConditionGroup
     actions: typing.Dict[str, actions.Action]
     hidden: bool = False
 
     class T_from_dict_required(typing.TypedDict):
         name: str
-        conditions: RuleConditions
+        disabled: typing.Union[DisabledDict, None]
+        conditions: RuleConditionGroup
         actions: typing.Dict[str, actions.Action]
 
     class T_from_dict(T_from_dict_required, total=False):
@@ -73,31 +309,7 @@ class Rule:
         return cls(**d)
 
 
-# TODO(sileht): rename me EvaluatedPullRequestRule ?
-@dataclasses.dataclass
-class EvaluatedRule:
-    name: str
-    conditions: RuleConditions
-    missing_conditions: RuleMissingConditions
-    actions: typing.Dict[str, actions.Action]
-    hidden: bool
-    errors: typing.List[str]
-
-    @classmethod
-    def from_rule(
-        cls,
-        rule: "Rule",
-        missing_conditions: RuleMissingConditions,
-        errors: typing.List[str],
-    ) -> "EvaluatedRule":
-        return cls(
-            rule.name,
-            rule.conditions,
-            missing_conditions,
-            rule.actions,
-            rule.hidden,
-            errors or [],
-        )
+EvaluatedRule = typing.NewType("EvaluatedRule", Rule)
 
 
 class QueueConfig(typing.TypedDict):
@@ -105,28 +317,7 @@ class QueueConfig(typing.TypedDict):
     speculative_checks: int
 
 
-@dataclasses.dataclass
-class EvaluatedQueueRule:
-    name: str
-    conditions: RuleConditions
-    missing_conditions: RuleMissingConditions
-    config: QueueConfig
-    errors: typing.List[str]
-
-    @classmethod
-    def from_rule(
-        cls,
-        rule: "QueueRule",
-        missing_conditions: RuleMissingConditions,
-        errors: typing.List[str],
-    ) -> "EvaluatedQueueRule":
-        return cls(
-            rule.name,
-            rule.conditions,
-            missing_conditions,
-            rule.config,
-            errors,
-        )
+EvaluatedQueueRule = typing.NewType("EvaluatedQueueRule", "QueueRule")
 
 
 QueueName = typing.NewType("QueueName", str)
@@ -135,12 +326,12 @@ QueueName = typing.NewType("QueueName", str)
 @dataclasses.dataclass
 class QueueRule:
     name: QueueName
-    conditions: RuleConditions
+    conditions: RuleConditionGroup
     config: QueueConfig
 
     class T_from_dict(QueueConfig, total=False):
         name: QueueName
-        conditions: RuleConditions
+        conditions: RuleConditionGroup
 
     @classmethod
     def from_dict(cls, d: T_from_dict) -> "QueueRule":
@@ -148,9 +339,24 @@ class QueueRule:
         conditions = d.pop("conditions")
         return cls(name, conditions, d)
 
-    async def get_pull_request_rule(self, ctxt: context.Context) -> EvaluatedQueueRule:
+    async def get_pull_request_rule(
+        self,
+        ctxt: context.Context,
+        pull: context.BasePullRequest,
+    ) -> EvaluatedQueueRule:
+        branch_protection_conditions = await get_branch_protection_conditions(ctxt)
+        queue_rule_with_branch_protection = QueueRule(
+            self.name,
+            RuleConditions(
+                self.conditions.copy().conditions + branch_protection_conditions
+            ),
+            self.config,
+        )
         queue_rules_evaluator = await QueuesRulesEvaluator.create(
-            [self], ctxt, EvaluatedQueueRule.from_rule, False
+            [queue_rule_with_branch_protection],
+            ctxt,
+            pull,
+            False,
         )
         return queue_rules_evaluator.matching_rules[0]
 
@@ -171,6 +377,7 @@ class GenericRulesEvaluator(typing.Generic[T_Rule, T_EvaluatedRule]):
         "author",
         "merged_by",
     )
+
     TEAM_ATTRIBUTES = (
         "author",
         "merged_by",
@@ -202,55 +409,52 @@ class GenericRulesEvaluator(typing.Generic[T_Rule, T_EvaluatedRule]):
         cls,
         rules: typing.List[T_Rule],
         ctxt: context.Context,
-        rule_to_evaluated_rule_method: typing.Callable[
-            [T_Rule, RuleMissingConditions, typing.List[str]],
-            T_EvaluatedRule,
-        ],
+        pull: context.BasePullRequest,
         hide_rule: bool,
     ) -> "GenericRulesEvaluator[T_Rule, T_EvaluatedRule]":
         self = cls(rules)
 
         for rule in self.rules:
-            ignore_rules = False
-            faulty_rules_errors = []
-            next_conditions_to_validate = []
-            for condition in rule.conditions:
-                for attrib in self.TEAM_ATTRIBUTES:
-                    # mypy thinks can take only Callable and not Coroutine
-                    condition.value_expanders[attrib] = functools.partial(  # type: ignore
+            for attrib in self.TEAM_ATTRIBUTES:
+                for condition in rule.conditions.walk():
+                    condition.partial_filter.value_expanders[
+                        attrib
+                    ] = functools.partial(  # type: ignore[assignment]
                         live_resolvers.teams, ctxt
                     )
-                try:
-                    pull_request_match = await condition(ctxt.pull_request)
-                except live_resolvers.LiveResolutionFailure as e:
-                    pull_request_match = False
-                    faulty_rules_errors.append(e.reason)
 
-                if not pull_request_match:
-                    next_conditions_to_validate.append(condition)
-                    if condition.attribute_name in self.BASE_ATTRIBUTES:
-                        ignore_rules = True
+            await rule.conditions(pull)
 
-            if faulty_rules_errors and hide_rule:
-                self.faulty_rules.append(
-                    rule_to_evaluated_rule_method(
-                        rule,
-                        RuleMissingConditions(next_conditions_to_validate),
-                        faulty_rules_errors,
-                    ),
-                )
-            elif ignore_rules and hide_rule:
-                self.ignored_rules.append(
-                    rule_to_evaluated_rule_method(
-                        rule, RuleMissingConditions(next_conditions_to_validate), []
-                    )
-                )
-            else:
-                self.matching_rules.append(
-                    rule_to_evaluated_rule_method(
-                        rule, RuleMissingConditions(next_conditions_to_validate), []
-                    )
-                )
+            # NOTE(sileht):
+            # In the summary, we display rules in four groups:
+            # * rules where all attributes match -> matching_rules
+            # * rules where only BASE_ATTRIBUTES match (filter out rule written for other branches) -> matching_rules
+            # * rules that won't work due to a configuration issue detected at runtime (eg team doesn't exists) -> faulty_rules
+            # * rules where only BASE_ATTRIBUTES don't match (mainly to hide rule written for other branches) -> ignored_rules
+            categorized = False
+
+            if hide_rule and not rule.conditions.match:
+                # NOTE(sileht): Replace non-base attribute by true, if it
+                # still matches it's a potential rule otherwise hide it.
+                base_conditions = rule.conditions.copy()
+                for condition in base_conditions.walk():
+                    attr = condition.get_attribute_name()
+                    if attr not in self.BASE_ATTRIBUTES:
+                        condition.update("number>0")
+
+                await base_conditions(pull)
+
+                if not base_conditions.match:
+                    self.ignored_rules.append(typing.cast(T_EvaluatedRule, rule))
+                    categorized = True
+
+                if not categorized and rule.conditions.is_faulty():
+                    self.faulty_rules.append(typing.cast(T_EvaluatedRule, rule))
+                    categorized = True
+
+            if not categorized:
+                self.matching_rules.append(typing.cast(T_EvaluatedRule, rule))
+
         return self
 
 
@@ -263,7 +467,9 @@ class PullRequestRules:
     rules: typing.List[Rule]
 
     def __post_init__(self):
-        # Make sure each rule has a unique name
+        # NOTE(sileht): Make sure each rule has a unique name because they are
+        # used to serialize the rule/action result in summary. And the summary
+        # uses as unique key something like: f"{rule.name} ({action.name})"
         sorted_rules = sorted(self.rules, key=operator.attrgetter("name"))
         grouped_rules = itertools.groupby(sorted_rules, operator.attrgetter("name"))
         for _, sub_rules in grouped_rules:
@@ -276,13 +482,66 @@ class PullRequestRules:
     def __iter__(self):
         return iter(self.rules)
 
-    def has_user_rules(self):
+    def has_user_rules(self) -> bool:
         return any(rule for rule in self.rules if not rule.hidden)
 
     async def get_pull_request_rule(self, ctxt: context.Context) -> RulesEvaluator:
-        return await RulesEvaluator.create(
-            self.rules, ctxt, EvaluatedRule.from_rule, True
-        )
+        runtime_rules = []
+        for rule in self.rules:
+            if not rule.actions:
+                runtime_rules.append(
+                    Rule(
+                        name=rule.name,
+                        disabled=rule.disabled,
+                        conditions=rule.conditions.copy(),
+                        actions=rule.actions,
+                        hidden=rule.hidden,
+                    )
+                )
+                continue
+
+            actions_with_special_rules = {}
+            actions_without_special_rules = {}
+            for name, action in rule.actions.items():
+                if name in ["queue", "merge"]:
+                    actions_with_special_rules[name] = action
+                else:
+                    actions_without_special_rules[name] = action
+
+            if actions_with_special_rules:
+                branch_protection_conditions = await get_branch_protection_conditions(
+                    ctxt
+                )
+                depends_on_conditions = await get_depends_on_conditions(ctxt)
+                if branch_protection_conditions or depends_on_conditions:
+                    runtime_rules.append(
+                        Rule(
+                            name=rule.name,
+                            disabled=rule.disabled,
+                            conditions=RuleConditions(
+                                rule.conditions.copy().conditions
+                                + branch_protection_conditions
+                                + depends_on_conditions
+                            ),
+                            actions=actions_with_special_rules,
+                            hidden=rule.hidden,
+                        )
+                    )
+                else:
+                    actions_without_special_rules.update(actions_with_special_rules)
+
+            if actions_without_special_rules:
+                runtime_rules.append(
+                    Rule(
+                        name=rule.name,
+                        disabled=rule.disabled,
+                        conditions=rule.conditions.copy(),
+                        actions=actions_without_special_rules,
+                        hidden=rule.hidden,
+                    )
+                )
+
+        return await RulesEvaluator.create(runtime_rules, ctxt, ctxt.pull_request, True)
 
 
 @dataclasses.dataclass
@@ -297,6 +556,9 @@ class QueueRules:
             if rule.name == key:
                 return rule
         raise KeyError(f"{key} not found")
+
+    def __len__(self):
+        return len(self.rules)
 
     def __post_init__(self):
         names = set()
@@ -313,7 +575,7 @@ class YAMLInvalid(voluptuous.Invalid):  # type: ignore[misc]
     def __str__(self):
         return f"{self.msg} at {self.path}"
 
-    def get_annotations(self, path):
+    def get_annotations(self, path: str) -> typing.List[github_types.GitHubAnnotation]:
         if self.path:
             error_path = self.path[0]
             return [
@@ -336,9 +598,11 @@ def YAML(v: bytes) -> typing.Any:
         return yaml.safe_load(v)
     except yaml.MarkedYAMLError as e:
         error_message = str(e)
-        path = [
-            types.LineColumnPath(e.problem_mark.line + 1, e.problem_mark.column + 1)
-        ]
+        path = []
+        if e.problem_mark is not None:
+            path.append(
+                types.LineColumnPath(e.problem_mark.line + 1, e.problem_mark.column + 1)
+            )
         raise YAMLInvalid(
             message="Invalid YAML", error_message=error_message, path=path
         )
@@ -347,16 +611,45 @@ def YAML(v: bytes) -> typing.Any:
         raise YAMLInvalid(message="Invalid YAML", error_message=error_message)
 
 
+def RuleConditionSchema(v: typing.Any, depth: int = 0) -> typing.Any:
+    if depth > 3:
+        raise voluptuous.Invalid("Maximun number of nested conditions reached")
+
+    return voluptuous.Schema(
+        voluptuous.Any(
+            voluptuous.All(str, voluptuous.Coerce(RuleCondition)),
+            voluptuous.All(
+                {
+                    "and": voluptuous.All(
+                        [lambda v: RuleConditionSchema(v, depth + 1)],
+                        voluptuous.Length(min=2),
+                    ),
+                    "or": voluptuous.All(
+                        [lambda v: RuleConditionSchema(v, depth + 1)],
+                        voluptuous.Length(min=2),
+                    ),
+                },
+                voluptuous.Length(min=1, max=1),
+                voluptuous.Coerce(RuleConditionGroup),
+            ),
+        )
+    )(v)
+
+
 def get_pull_request_rules_schema(partial_validation: bool = False) -> voluptuous.All:
     return voluptuous.All(
         [
             voluptuous.All(
                 {
                     voluptuous.Required("name"): str,
+                    voluptuous.Required("disabled", default=None): voluptuous.Any(
+                        None, {voluptuous.Required("reason"): str}
+                    ),
                     voluptuous.Required("hidden", default=False): bool,
-                    voluptuous.Required("conditions"): [
-                        voluptuous.All(str, voluptuous.Coerce(RuleCondition))
-                    ],
+                    voluptuous.Required("conditions"): voluptuous.All(
+                        [voluptuous.Coerce(RuleConditionSchema)],
+                        voluptuous.Coerce(RuleConditions),
+                    ),
                     voluptuous.Required("actions"): actions.get_action_schemas(
                         partial_validation
                     ),
@@ -373,9 +666,10 @@ QueueRulesSchema = voluptuous.All(
         voluptuous.All(
             {
                 voluptuous.Required("name"): str,
-                voluptuous.Required("conditions"): [
-                    voluptuous.All(str, voluptuous.Coerce(RuleCondition))
-                ],
+                voluptuous.Required("conditions"): voluptuous.All(
+                    [voluptuous.Coerce(RuleConditionSchema)],
+                    voluptuous.Coerce(RuleConditions),
+                ),
                 voluptuous.Required("speculative_checks", default=1): voluptuous.All(
                     int, voluptuous.Range(min=1, max=20)
                 ),
@@ -461,18 +755,25 @@ class InvalidRules(Exception):
             msg += f"\n```\n{error.error_message}\n```"
         return msg
 
+    @classmethod
+    def _walk_error(cls, root_error):
+        if isinstance(root_error, voluptuous.MultipleInvalid):
+            for error1 in root_error.errors:
+                for error2 in cls._walk_error(error1):
+                    yield error2
+        else:
+            yield root_error
+
     @property
     def errors(self):
-        if isinstance(self.error, voluptuous.MultipleInvalid):
-            return self.error.errors
-        return [self.error]
+        return list(self._walk_error(self.error))
 
     def __str__(self):
         if len(self.errors) >= 2:
             return "* " + "\n* ".join(sorted(map(self._format_error, self.errors)))
         return self._format_error(self.errors[0])
 
-    def get_annotations(self, path):
+    def get_annotations(self, path: str) -> typing.List[github_types.GitHubAnnotation]:
         return functools.reduce(
             operator.add,
             (

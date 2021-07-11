@@ -13,26 +13,25 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
-import collections
 import dataclasses
 import typing
 import uuid
 
 import tenacity
 
-from mergify_engine import config
 from mergify_engine import context
 from mergify_engine import exceptions
 from mergify_engine import gitter
+from mergify_engine import user_tokens
 from mergify_engine.clients import http
 
 
 class BranchUpdateFailure(Exception):
     def __init__(
         self,
-        msg="",
-        title="Base branch update has failed",
-    ):
+        msg: str = "",
+        title: str = "Base branch update has failed",
+    ) -> None:
         error_code = "err-code: " + uuid.uuid4().hex[-5:].upper()
         self.title = title
         self.message = msg + "\n" + error_code
@@ -42,32 +41,6 @@ class BranchUpdateFailure(Exception):
 @dataclasses.dataclass
 class BranchUpdateNeedRetry(exceptions.EngineNeedRetry):
     message: str
-
-
-class AuthenticationFailure(Exception):
-    pass
-
-
-GIT_MESSAGE_TO_EXCEPTION = collections.OrderedDict(
-    [
-        ("This repository was archived so it is read-only.", BranchUpdateFailure),
-        ("organization has enabled or enforced SAML SSO.", BranchUpdateFailure),
-        ("Invalid username or password", AuthenticationFailure),
-        ("Repository not found", AuthenticationFailure),
-        ("The requested URL returned error: 403", AuthenticationFailure),
-        ("Patch failed at", BranchUpdateFailure),
-        ("remote contains work that you do", BranchUpdateNeedRetry),
-        ("remote end hung up unexpectedly", BranchUpdateNeedRetry),
-        ("cannot lock ref 'refs/heads/", BranchUpdateNeedRetry),
-        ("Could not resolve host", BranchUpdateNeedRetry),
-        ("Operation timed out", BranchUpdateNeedRetry),
-        ("No such device or address", BranchUpdateNeedRetry),
-        ("Protected branch update failed", BranchUpdateFailure),
-        ("couldn't find remote ref", BranchUpdateFailure),
-    ]
-)
-
-GIT_MESSAGE_TO_UNSHALLOW = {"shallow update not allowed", "unrelated histories"}
 
 
 def pre_update_check(ctxt: context.Context) -> None:
@@ -81,7 +54,7 @@ def pre_update_check(ctxt: context.Context) -> None:
             "Mergify needs the author permission to update the base branch of the pull request.\n"
             f"{ctxt.pull['head']['repo']['owner']['login']} needs to "
             "[authorize modification on its head branch]"
-            "(https://help.github.com/articles/allowing-changes-to-a-pull-request-branch-created-from-a-fork/).",
+            "(https://docs.github.com/en/github/collaborating-with-pull-requests/working-with-forks/allowing-changes-to-a-pull-request-branch-created-from-a-fork).",
             title="Pull request can't be updated with latest base branch changes",
         )
 
@@ -105,19 +78,19 @@ async def pre_rebase_check(ctxt: context.Context) -> None:
         )
     elif await ctxt.github_workflow_changed():
         raise BranchUpdateFailure(
-            "GitHub App like Mergify are not allowed to merge pull request where `.github/workflows` is changed.`n"
-            "This pull request must be merged manually.",
+            "GitHub App like Mergify are not allowed to rebase pull request where `.github/workflows` is changed.\n"
+            "This pull request must be rebased manually.",
             title="Pull request can't be updated with latest base branch changes",
         )
 
 
 @tenacity.retry(
-    wait=tenacity.wait_exponential(multiplier=0.2),
-    stop=tenacity.stop_after_attempt(5),
-    retry=tenacity.retry_if_exception_type(BranchUpdateNeedRetry),
+    wait=tenacity.wait_exponential(multiplier=0.2),  # type: ignore[no-untyped-call]
+    stop=tenacity.stop_after_attempt(5),  # type: ignore[no-untyped-call]
+    retry=tenacity.retry_if_exception_type(BranchUpdateNeedRetry),  # type: ignore[no-untyped-call]
     reraise=True,
 )
-async def _do_rebase(ctxt: context.Context, token: str) -> None:
+async def _do_rebase(ctxt: context.Context, user: user_tokens.UserTokensUser) -> None:
     # NOTE(sileht):
     # $ curl https://api.github.com/repos/sileht/repotest/pulls/2 | jq .commits
     # 2
@@ -131,103 +104,54 @@ async def _do_rebase(ctxt: context.Context, token: str) -> None:
     # $ git rebase upstream/master
     # $ git push origin sileht/testpr:sileht/testpr
 
-    head_repo = (
-        ctxt.pull["head"]["repo"]["owner"]["login"]
-        + "/"
-        + ctxt.pull["head"]["repo"]["name"]
-    )
-    base_repo = (
-        ctxt.pull["base"]["repo"]["owner"]["login"]
-        + "/"
-        + ctxt.pull["base"]["repo"]["name"]
-    )
+    if ctxt.pull["head"]["repo"] is None:
+        raise BranchUpdateFailure("The head repository does not exists anymore")
 
     head_branch = ctxt.pull["head"]["ref"]
     base_branch = ctxt.pull["base"]["ref"]
     git = gitter.Gitter(ctxt.log)
     try:
         await git.init()
-        await git.configure()
-        await git.add_cred(token, "", head_repo)
-        await git.add_cred(token, "", base_repo)
-        await git("remote", "add", "origin", f"{config.GITHUB_URL}/{head_repo}")
-        await git("remote", "add", "upstream", f"{config.GITHUB_URL}/{base_repo}")
-
-        depth = len(await ctxt.commits) + 1
-        await git("fetch", "--quiet", f"--depth={depth}", "origin", head_branch)
-        await git("checkout", "-q", "-b", head_branch, f"origin/{head_branch}")
-
-        output = await git("log", "--format=%cI")
-        last_commit_date = [d for d in output.split("\n") if d.strip()][-1]
-
-        await git(
-            "fetch",
-            "--quiet",
-            "upstream",
-            base_branch,
-            f"--shallow-since='{last_commit_date}'",
+        if ctxt.subscription.active:
+            await git.configure(user["name"] or user["login"], user["email"])
+        else:
+            await git.configure()
+        await git.setup_remote(
+            "origin", ctxt.pull["head"]["repo"], user["oauth_access_token"], ""
+        )
+        await git.setup_remote(
+            "upstream", ctxt.pull["base"]["repo"], user["oauth_access_token"], ""
         )
 
-        # Try to find the merge base, but don't fetch more that 1000 commits.
-        for _ in range(20):
-            await git("repack", "-d")
-            try:
-                await git(
-                    "merge-base",
-                    f"upstream/{base_branch}",
-                    f"origin/{head_branch}",
-                )
-            except gitter.GitError as e:  # pragma: no cover
-                if e.returncode == 1:
-                    # We need more commits
-                    await git("fetch", "-q", "--deepen=50", "upstream", base_branch)
-                    continue
-                raise
-            else:
-                break
+        await git("fetch", "--quiet", "origin", head_branch)
+        await git("checkout", "-q", "-b", head_branch, f"origin/{head_branch}")
 
-        try:
-            await git("rebase", f"upstream/{base_branch}")
-            await git("push", "--verbose", "origin", head_branch, "-f")
-        except gitter.GitError as e:  # pragma: no cover
-            for message in GIT_MESSAGE_TO_UNSHALLOW:
-                if message in e.output:
-                    ctxt.log.info("Complete history cloned")
-                    # NOTE(sileht): We currently assume we have only one parent
-                    # commit in common. Since Git is a graph, in some case this
-                    # graph can be more complicated.
-                    # So, retrying with the whole git history for now
-                    await git("fetch", "--unshallow")
-                    await git("fetch", "--quiet", "origin", head_branch)
-                    await git("fetch", "--quiet", "upstream", base_branch)
-                    await git("rebase", f"upstream/{base_branch}")
-                    await git("push", "--verbose", "origin", head_branch, "-f")
-                    break
-            else:
-                raise
+        await git("fetch", "--quiet", "upstream", base_branch)
+
+        await git("rebase", f"upstream/{base_branch}")
+        await git("push", "--verbose", "origin", head_branch, "--force-with-lease")
 
         expected_sha = (await git("log", "-1", "--format=%H")).strip()
         # NOTE(sileht): We store this for dismissal action
         await ctxt.redis.setex(f"branch-update-{expected_sha}", 60 * 60, expected_sha)
-    except gitter.GitError as in_exception:  # pragma: no cover
-        if in_exception.output == "":
-            # SIGKILL...
-            raise BranchUpdateNeedRetry("Git process got killed")
-
-        for message, out_exception in GIT_MESSAGE_TO_EXCEPTION.items():
-            if message in in_exception.output:
-                raise out_exception(
-                    "Git reported the following error:\n"
-                    f"```\n{in_exception.output}\n```\n"
-                )
-        else:
-            ctxt.log.error(
-                "update branch failed: %s",
-                in_exception.output,
-                exc_info=True,
-            )
-            raise BranchUpdateFailure()
-
+    except gitter.GitAuthenticationFailure:
+        raise
+    except gitter.GitErrorRetriable as e:
+        raise BranchUpdateNeedRetry(
+            f"Git reported the following error:\n```\n{e.output}\n```\n"
+        )
+    except gitter.GitFatalError as e:
+        raise BranchUpdateFailure(
+            f"Git reported the following error:\n```\n{e.output}\n```\n"
+        )
+    except gitter.GitError as e:
+        ctxt.log.error(
+            "update branch failed",
+            output=e.output,
+            returncode=e.returncode,
+            exc_info=True,
+        )
+        raise BranchUpdateFailure()
     except Exception:  # pragma: no cover
         ctxt.log.error("update branch failed", exc_info=True)
         raise BranchUpdateFailure()
@@ -236,11 +160,12 @@ async def _do_rebase(ctxt: context.Context, token: str) -> None:
 
 
 async def update_with_api(ctxt: context.Context) -> None:
+    ctxt.log.info("updating base branch with api")
     pre_update_check(ctxt)
     try:
         await ctxt.client.put(
             f"{ctxt.base_url}/pulls/{ctxt.pull['number']}/update-branch",
-            api_version="lydian",  # type: ignore[call-arg]
+            api_version="lydian",
             json={"expected_head_sha": ctxt.pull["head"]["sha"]},
         )
     except http.HTTPClientSideError as e:
@@ -264,33 +189,28 @@ async def update_with_api(ctxt: context.Context) -> None:
 
 
 async def rebase_with_git(
-    ctxt: context.Context, user: typing.Optional[str] = None
+    ctxt: context.Context, bot_account: typing.Optional[str] = None
 ) -> None:
+    ctxt.log.info("updating base branch with git")
 
     await pre_rebase_check(ctxt)
 
-    user_tokens = await ctxt.repository.installation.get_user_tokens()
-    if user:
-        token = user_tokens.get_token_for(user)
-        if token:
-            creds = {user.lower(): token}
-        else:
-            raise BranchUpdateFailure(
-                f"Unable to rebase: user `{user}` is unknown. "
-                f"Please make sure `{user}` has logged in Mergify dashboard."
-            )
-    else:
-        creds = user_tokens.tokens
+    try:
+        users = await user_tokens.UserTokens.select_users_for(ctxt, bot_account)
+    except user_tokens.UserTokensUserNotFound as e:
+        raise BranchUpdateFailure(f"Unable to rebase: {e.reason}")
 
-    for login, token in creds.items():
+    for user in users:
         try:
-            return await _do_rebase(ctxt, token)
-        except AuthenticationFailure as e:  # pragma: no cover
+            await _do_rebase(ctxt, user)
+        except gitter.GitAuthenticationFailure as e:  # pragma: no cover
             ctxt.log.info(
                 "authentification failure, will retry another token: %s",
                 e,
-                login=login,
+                login=user["login"],
             )
+        else:
+            return
 
     ctxt.log.warning("unable to update branch: no tokens are valid")
 

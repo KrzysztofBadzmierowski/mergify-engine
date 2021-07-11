@@ -21,6 +21,7 @@ import voluptuous
 from mergify_engine import constants
 from mergify_engine import context
 from mergify_engine import github_types
+from mergify_engine import rules
 from mergify_engine import subscription
 from mergify_engine.actions import merge
 from mergify_engine.actions import merge_base
@@ -151,6 +152,7 @@ async def test_merge_commit_message(body, title, message, mode):
     client = mock.MagicMock()
     installation = context.Installation(123, "whatever", {}, client, None)
     repository = context.Repository(installation, "whatever", 123)
+    repository._cache["branches"] = {"master": {"protection": {"enabled": False}}}
     ctxt = await context.Context.create(repository=repository, pull=pull)
     ctxt._cache["pull_statuses"] = [
         github_types.GitHubStatus(
@@ -164,8 +166,7 @@ async def test_merge_commit_message(body, title, message, mode):
         )
     ]
     ctxt._cache["pull_check_runs"] = []
-    pr = ctxt.pull_request
-    assert await merge.MergeAction._get_commit_message(pr, mode=mode) == (
+    assert await ctxt.pull_request.get_commit_message(mode=mode) == (
         title,
         message,
     )
@@ -203,7 +204,7 @@ async def test_merge_commit_message_undefined(body):
     repository = context.Repository(installation, "whatever", 123)
     pr = await context.Context.create(repository=repository, pull=pull)
     with pytest.raises(context.RenderTemplateFailure) as x:
-        await merge.MergeAction._get_commit_message(pr.pull_request)
+        await pr.pull_request.get_commit_message()
         assert str(x) == "foobar"
 
 
@@ -231,7 +232,7 @@ async def test_merge_commit_message_syntax_error(body, error, redis_cache):
     repository = context.Repository(installation, "whatever", 123)
     pr = await context.Context.create(repository=repository, pull=pull)
     with pytest.raises(context.RenderTemplateFailure) as rmf:
-        await merge.MergeAction._get_commit_message(pr.pull_request)
+        await pr.pull_request.get_commit_message()
         assert str(rmf) == error
 
 
@@ -292,7 +293,7 @@ async def test_queue_summary(redis_cache):
 ---
 
 """ + constants.MERGIFY_PULL_REQUEST_DOC == await action._get_queue_summary(
-            ctxt, mock.Mock(missing_conditions=[], conditions=[]), q
+            ctxt, mock.Mock(conditions=rules.RuleConditions([])), q
         )
 
 

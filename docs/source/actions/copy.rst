@@ -42,6 +42,13 @@ Options
      - ``true``
      - Whether to create the pull requests even if they are conflicts when
        cherry-picking the commits.
+   * - ``bot_account``
+     - :ref:`data type template`
+     -
+     - |premium plan tag|
+       Mergify can impersonate a GitHub user to copy a pull request.
+       If no ``bot_account`` is set, Mergify copies the pull request
+       itself.
    * - ``labels``
      - list of string
      - ``[]``
@@ -61,13 +68,18 @@ Options
      - :ref:`data type template`
      - ``{{ title }} (copy #{{ number }})``
      - The pull request title.
+   * - ``body``
+     - :ref:`data type template`
+     - ``This is an automatic copy of pull request #{{number}} done by [Mergify](https://mergify.io).\n{{cherry_pick_error}}``
+     - The pull request body.
 
 
-As the ``title`` is a :ref:`template <data type template>`, you can
+As the ``title`` and ``body`` are :ref:`templates <data type template>`, you can
 leverage any pull request attributes to use as content, e.g. ``{{author}}``.
 You can also use this additional variable:
 
     * ``{{ destination_branch }}``: the name of destination branch.
+    * ``{{ cherry_pick_error }}``: the cherry pick error message if any (only available in ``body``).
 
 Examples
 --------

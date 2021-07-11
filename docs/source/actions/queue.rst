@@ -16,6 +16,15 @@ Merge queues prevent merging broken pull requests by serializing their merge.
 Merging broken pull requests can happen when outdated pull requests are being
 merged in their base branch.
 
+Mergify always respects the `branch protection`_ settings. When the conditions
+match and the ``queue`` action runs, Mergify waits for the branch protection to
+be validated before embarking and merging the pull request.
+
+.. _`branch protection`: https://docs.github.com/en/github/administering-a-repository/about-protected-branches
+
+Mergify also waits for dependent pull requests to get merged first (see :ref:`merge-depends-on`).
+
+
 Why Queues?
 -----------
 
@@ -256,13 +265,21 @@ A ``queue_rules`` takes the following parameter:
    * - ``conditions``
      - list of :ref:`Conditions`
      -
-     - The list of ``conditions`` to match to get the queued pull request merged.
+     - The list of ``conditions`` to match to get the queued pull request merged,
+       In case of speculative merge pull request, the conditions starting by
+       ``check-`` are evaluated against the temporary pull request instead of the
+       original one.
    * - ``speculative_checks``
      - int
      - 1
      - |premium plan tag| The maximum number of checks to run in parallel in the queue. Must be
        between 1 and 20.
        See :ref:`speculative checks`.
+
+.. note::
+
+   |premium plan tag|
+   Defining multiple queue rules is only available for `Premium subscribers <https://mergify.io/pricing>`_.
 
 
 Examples
@@ -299,6 +316,7 @@ in the queue, it will be updated with the latest commit of its base branch.
 
 🚥 Multiple Queues
 ~~~~~~~~~~~~~~~~~~
+|premium plan tag|
 
 By using multiple queues, it's possible to put some pull requests in a higher
 priority queue. As queues are processed one after the other, the following
@@ -373,5 +391,33 @@ three enqueued pull requests are mergeable.
         actions:
           queue:
             name: default
+
+.. _merge-depends-on:
+
+⛓️ Defining Pull Request Dependencies
+-------------------------------------
+
+|premium plan tag|
+|open source plan tag|
+
+You can specify dependencies between pull requests from the same repository.
+Mergify waits for the linked pull requests to be merged before merging any pull
+request with a ``Depends-On:`` header.
+
+To use this feature, adds the ``Depends-On:`` header to the body of your pull
+request:
+
+.. code-block:: md
+
+    New awesome feature 🎉
+
+    To get the full picture, you may need to look at these pull requests:
+
+    Depends-On: #42
+    Depends-On: https://github.com/organization/repository/pull/123
+
+.. warning::
+
+    This feature does not work for cross-repository dependencies.
 
 .. include:: ../global-substitutions.rst

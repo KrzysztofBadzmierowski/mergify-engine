@@ -53,13 +53,14 @@ html_show_sourcelink = False
 html_show_sphinx = False
 # Our templates are based on this
 html_theme = "basic"
+html_style = "mergify.css"
 html_sidebars = {
     "**": [
         "navigation.html",
         "relations.html",
     ]
 }
-html_add_permalinks = " 🔗"
+html_permalinks_icon = "🔗"
 
 # Spelling checker configuration
 spelling_warning = True

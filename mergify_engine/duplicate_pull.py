@@ -27,6 +27,7 @@ from mergify_engine import github_types
 from mergify_engine import gitter
 from mergify_engine import subscription
 from mergify_engine.clients import http
+from mergify_engine.user_tokens import UserTokensUser
 
 
 @dataclasses.dataclass
@@ -55,14 +56,8 @@ class DuplicateFailed(Exception):
 
 
 GIT_MESSAGE_TO_EXCEPTION = {
-    "No such device or address": DuplicateNeedRetry,
-    "Could not resolve host": DuplicateNeedRetry,
-    "couldn't find remote ref": DuplicateFailed,
-    "Authentication failed": DuplicateNeedRetry,
-    "remote end hung up unexpectedly": DuplicateNeedRetry,
-    "Operation timed out": DuplicateNeedRetry,
-    "reference already exists": DuplicateAlreadyExists,
     "Aborting commit due to empty commit message": DuplicateNotNeeded,
+    "reference already exists": DuplicateAlreadyExists,
     "You may want to first integrate the remote changes": DuplicateAlreadyExists,
 }
 
@@ -184,10 +179,10 @@ async def _get_commits_to_cherrypick(
         ctxt.log.debug("Pull request merged with merge commit")
         return await _get_commits_without_base_branch_merge(ctxt)
 
-    else:  # pragma: no cover
-        # NOTE(sileht): What is that?
-        ctxt.log.error("unhandled commit structure")
-        return []
+    elif len(merge_commit["parents"]) >= 3:
+        raise DuplicateFailed("merge commit with more than 2 parents are unsupported")
+    else:
+        raise RuntimeError("merge commit with no parents")
 
 
 KindT = typing.Literal["backport", "copy"]
@@ -202,16 +197,18 @@ def get_destination_branch_name(
 
 
 @tenacity.retry(
-    wait=tenacity.wait_exponential(multiplier=0.2),
-    stop=tenacity.stop_after_attempt(5),
-    retry=tenacity.retry_if_exception_type(DuplicateNeedRetry),
+    wait=tenacity.wait_exponential(multiplier=0.2),  # type: ignore[no-untyped-call]
+    stop=tenacity.stop_after_attempt(5),  # type: ignore[no-untyped-call]
+    retry=tenacity.retry_if_exception_type(DuplicateNeedRetry),  # type: ignore[no-untyped-call]
     reraise=True,
 )
 async def duplicate(
     ctxt: context.Context,
-    title: str,
     branch_name: github_types.GitHubRefType,
     *,
+    title_template: str,
+    body_template: str,
+    bot_account: typing.Optional[str] = None,
     labels: typing.Optional[List[str]] = None,
     label_conflicts: typing.Optional[str] = None,
     ignore_conflicts: bool = False,
@@ -223,21 +220,22 @@ async def duplicate(
 
     :param pull: The pull request.
     :type pull: py:class:mergify_engine.context.Context
-    :param title: The pull request title.
+    :param title_template: The pull request title template.
+    :param body_template: The pull request body template.
     :param branch: The branch to copy to.
     :param labels: The list of labels to add to the created PR.
     :param label_conflicts: The label to add to the created PR when cherry-pick failed.
     :param ignore_conflicts: Whether to commit the result if the cherry-pick fails.
     :param assignees: The list of users to be assigned to the created PR.
     :param kind: is a backport or a copy
+    :param branch_prefix: the prefix of the temporary created branch
     """
     repo_full_name = ctxt.pull["base"]["repo"]["full_name"]
     bp_branch = get_destination_branch_name(
         ctxt.pull["number"], branch_name, branch_prefix
     )
 
-    cherry_pick_fail = False
-    body = ""
+    cherry_pick_error: str = ""
 
     repo_info = await ctxt.client.item(f"/repos/{repo_full_name}")
     if repo_info["size"] > config.NOSUB_MAX_REPO_SIZE_KB:
@@ -252,16 +250,38 @@ async def duplicate(
             )
         ctxt.log.info("running %s on large repository", kind)
 
+    bot_account_user: typing.Optional[UserTokensUser] = None
+    if bot_account is not None:
+        user_tokens = await ctxt.repository.installation.get_user_tokens()
+        bot_account_user = user_tokens.get_token_for(bot_account)
+        if not bot_account_user:
+            raise DuplicateFailed(
+                f"{kind} fail: user `{bot_account}` is unknown. "
+                f"Please make sure `{bot_account}` has logged in Mergify dashboard."
+            )
+
     # TODO(sileht): This can be done with the Github API only I think:
     # An example:
     # https://github.com/shiqiyang-okta/ghpick/blob/master/ghpick/cherry.py
     git = gitter.Gitter(ctxt.log)
     try:
-        token = ctxt.client.auth.get_access_token()
         await git.init()
-        await git.configure()
-        await git.add_cred("x-access-token", token, repo_full_name)
-        await git("remote", "add", "origin", f"{config.GITHUB_URL}/{repo_full_name}")
+
+        if bot_account_user is None:
+            token = ctxt.client.auth.get_access_token()
+            await git.configure()
+            username = "x-access-token"
+            password = token
+        else:
+            await git.configure(
+                bot_account_user["name"] or bot_account_user["login"],
+                bot_account_user["email"],
+            )
+            username = bot_account_user["oauth_access_token"]
+            password = ""  # nosec
+
+        await git.setup_remote("origin", ctxt.pull["base"]["repo"], username, password)
+
         await git("fetch", "--quiet", "origin", f"pull/{ctxt.pull['number']}/head")
         await git("fetch", "--quiet", "origin", ctxt.pull["base"]["ref"])
         await git("fetch", "--quiet", "origin", branch_name)
@@ -284,41 +304,65 @@ async def duplicate(
             except gitter.GitError as e:  # pragma: no cover
                 ctxt.log.info("fail to cherry-pick %s: %s", commit["sha"], e.output)
                 output = await git("status")
-                body += f"\n\nCherry-pick of {commit['sha']} has failed:\n```\n{output}```\n\n"
+                cherry_pick_error += f"Cherry-pick of {commit['sha']} has failed:\n```\n{output}```\n\n\n"
                 if not ignore_conflicts:
-                    raise DuplicateFailed(body)
-                cherry_pick_fail = True
+                    raise DuplicateFailed(cherry_pick_error)
                 await git("add", "*")
                 await git("commit", "-a", "--no-edit", "--allow-empty")
 
         await git("push", "origin", bp_branch)
-    except gitter.GitError as in_exception:  # pragma: no cover
-        if in_exception.output == "":
-            raise DuplicateNeedRetry("git process got sigkill")
-
+    except gitter.GitAuthenticationFailure:
+        raise
+    except gitter.GitErrorRetriable as e:
+        raise DuplicateNeedRetry(
+            f"Git reported the following error:\n```\n{e.output}\n```\n"
+        )
+    except gitter.GitFatalError as e:
+        raise DuplicateUnexpectedError(
+            f"Git reported the following error:\n```\n{e.output}\n```\n"
+        )
+    except gitter.GitError as e:  # pragma: no cover
         for message, out_exception in GIT_MESSAGE_TO_EXCEPTION.items():
-            if message in in_exception.output:
+            if message in output:
                 raise out_exception(
-                    "Git reported the following error:\n"
-                    f"```\n{in_exception.output}\n```\n"
+                    f"Git reported the following error:\n```\n{e.output}\n```\n"
                 )
-        else:
-            raise DuplicateUnexpectedError(in_exception.output)
+        ctxt.log.error(
+            "duplicate pull failed",
+            output=e.output,
+            returncode=e.returncode,
+            exc_info=True,
+        )
+        raise DuplicateUnexpectedError(e.output)
     finally:
         await git.cleanup()
 
-    body = (
-        f"This is an automatic {kind} of pull request #{ctxt.pull['number']} done by [Mergify](https://mergify.io)."
-        + body
-    )
-
-    if cherry_pick_fail:
-        body += (
-            "To fixup this pull request, you can check out it locally. "
+    if cherry_pick_error:
+        cherry_pick_error += (
+            "To fix up this pull request, you can check it out locally. "
             "See documentation: "
-            "https://help.github.com/articles/"
-            "checking-out-pull-requests-locally/"
+            "https://docs.github.com/en/github/"
+            "collaborating-with-pull-requests/reviewing-changes-in-pull-requests/checking-out-pull-requests-locally"
         )
+
+    try:
+        title = await ctxt.pull_request.render_template(
+            title_template,
+            extra_variables={"destination_branch": branch_name},
+        )
+    except context.RenderTemplateFailure as rmf:
+        raise DuplicateFailed(f"Invalid title message: {rmf}")
+
+    try:
+        body = await ctxt.pull_request.render_template(
+            body_template,
+            extra_variables={
+                "destination_branch": branch_name,
+                "cherry_pick_error": cherry_pick_error,
+            },
+        )
+    except context.RenderTemplateFailure as rmf:
+        raise DuplicateFailed(f"Invalid title message: {rmf}")
 
     try:
         duplicate_pr = typing.cast(
@@ -334,19 +378,25 @@ async def duplicate(
                         "base": branch_name,
                         "head": bp_branch,
                     },
+                    oauth_token=bot_account_user["oauth_access_token"]
+                    if bot_account_user
+                    else None,
                 )
             ).json(),
         )
     except http.HTTPClientSideError as e:
         if e.status_code == 422 and "No commits between" in e.message:
-            raise DuplicateNotNeeded(e.message)
+            if cherry_pick_error:
+                raise DuplicateFailed(cherry_pick_error)
+            else:
+                raise DuplicateNotNeeded(e.message)
         raise
 
     effective_labels = []
     if labels is not None:
         effective_labels.extend(labels)
 
-    if cherry_pick_fail and label_conflicts is not None:
+    if cherry_pick_error and label_conflicts is not None:
         effective_labels.append(label_conflicts)
 
     if len(effective_labels) > 0:

@@ -20,7 +20,6 @@ import typing
 import daiquiri
 
 from mergify_engine import context
-from mergify_engine import github_types
 
 
 LOG = daiquiri.getLogger(__name__)
@@ -36,23 +35,30 @@ EventName = typing.Literal[
     "action.dismiss_reviews",
     "action.label",
     "action.merge",
+    "action.queue",
     "action.post_check",
     "action.rebase",
     "action.refresh",
     "action.request_reviewers",
     "action.review",
+    "action.squash",
     "action.update",
 ]
 
+SignalMetadata = typing.Dict[str, typing.Union[str, int, float, bool]]
 SignalT = typing.Callable[
-    [github_types.GitHubAccount, EventName], typing.Coroutine[None, None, None]
+    [context.Context, EventName, typing.Optional[SignalMetadata]],
+    typing.Coroutine[None, None, None],
 ]
 
 
 class SignalBase(abc.ABC):
     @abc.abstractmethod
     async def __call__(
-        self, account: github_types.GitHubAccount, event: EventName
+        self,
+        ctxt: context.Context,
+        event: EventName,
+        metadata: typing.Optional[SignalMetadata],
     ) -> None:
         pass
 
@@ -78,9 +84,13 @@ def setup() -> None:
             LOG.error("failed to load signal: %s", mod.name, exc_info=True)
 
 
-async def send(ctxt: context.Context, event: EventName) -> None:
+async def send(
+    ctxt: context.Context,
+    event: EventName,
+    metadata: typing.Optional[SignalMetadata] = None,
+) -> None:
     for name, signal in SIGNALS.items():
         try:
-            await signal(ctxt.pull["base"]["user"], event)
+            await signal(ctxt, event, metadata)
         except Exception:
             LOG.error("failed to run signal: %s", name, exc_info=True)

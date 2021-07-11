@@ -29,7 +29,7 @@ async def api_call(url, method="post"):
 
     async with http.AsyncClient() as client:
         r = await client.request(
-            method, url, headers={"X-Hub-Signature": "sha1=" + hmac}, data=data
+            method, url, headers={"X-Hub-Signature": "sha1=" + hmac}, content=data
         )
     r.raise_for_status()
     print(r.text)
@@ -76,7 +76,7 @@ def refresher():
 
 def queues():
     parser = argparse.ArgumentParser(description="Show queue of mergify_engine")
-    parser.add_argument("owner_id")
+    parser.add_argument("owner_id", type=int)
 
     args = parser.parse_args()
     asyncio.run(

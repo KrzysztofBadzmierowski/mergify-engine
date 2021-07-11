@@ -1,18 +1,21 @@
 name: Continuous Integration
+permissions: read-all
+
 on:
   pull_request:
     branches:
-      - master
+      - main
+      - git_push_stack/**
 
 jobs:
   requirements:
     timeout-minutes: 5
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v2.3.4
+      - uses: actions/setup-python@v2.2.2
         with:
-          python-version: 3.9.0
+          python-version: 3.9.6
       - run: |
           pip install tox
           tox -e requirements
@@ -20,15 +23,38 @@ jobs:
           tox -e genreqs
           git diff --exit-code
 
+  heroku:
+    timeout-minutes: 10
+    runs-on: ubuntu-20.04
+    services:
+      redis:
+        image: redis:latest
+        ports:
+          - 6363:6379
+    steps:
+      - uses: actions/checkout@v2.3.4
+      - run: |
+          echo '-e .' >> requirements.txt
+          curl -sSL \
+            "https://github.com/buildpacks/pack/releases/download/v0.18.1/pack-v0.18.1-linux.tgz" \
+            | tar -xz pack
+          ./pack build test_img --builder heroku/buildpacks:20 --buildpack heroku/python
+          docker run \
+            --env-file fake.env \
+            -e MERGIFYENGINE_STORAGE_URL=redis://redis:6363 \
+            --entrypoint /bin/bash \
+            test_img \
+            -c 'cd /app ; for i in .profile.d/*.sh; do source $i; done; mergify-import-check'
+
 
   pep8:
     timeout-minutes: 5
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v2.3.4
+      - uses: actions/setup-python@v2.2.2
         with:
-          python-version: 3.9.0
+          python-version: 3.9.6
       - run: |
           pip install tox
           tox -e pep8
@@ -42,30 +68,17 @@ jobs:
         ports:
           - 6363:6379
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v2.3.4
+      - uses: actions/setup-python@v2.2.2
         with:
-          python-version: 3.9.0
+          python-version: 3.9.6
       - run: |
           sudo apt install -y redis-server
           pip install tox
           tox -e py39
 
-  docs:
-    timeout-minutes: 5
-    runs-on: ubuntu-20.04
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-        with:
-          python-version: 3.9.0
-      - run: |
-          sudo apt-get install graphviz
-          pip install tox
-          tox -e docs
-
   docker:
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: docker/build-push-action@v2
+      - uses: actions/checkout@v2.3.4
+      - uses: docker/build-push-action@v2.6.1

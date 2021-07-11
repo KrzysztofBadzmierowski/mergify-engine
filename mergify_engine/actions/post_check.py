@@ -14,6 +14,8 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import typing
+
 import voluptuous
 
 from mergify_engine import actions
@@ -65,16 +67,10 @@ class PostCheckAction(actions.Action):
                 ),
             )
 
-        check_succeed = not bool(rule.missing_conditions)
-        check_conditions = ""
-        for cond in rule.conditions:
-            checked = " " if cond in rule.missing_conditions else "X"
-            check_conditions += f"\n- [{checked}] `{cond}`"
-
-        extra_variables = {
+        extra_variables: typing.Dict[str, typing.Union[str, bool]] = {
             "check_rule_name": rule.name,
-            "check_succeed": check_succeed,
-            "check_conditions": check_conditions,
+            "check_succeed": rule.conditions.match,
+            "check_conditions": rule.conditions.get_summary(),
         }
         try:
             title = await ctxt.pull_request.render_template(
@@ -100,10 +96,10 @@ class PostCheckAction(actions.Action):
             )
 
         await signals.send(ctxt, "action.post_check")
-        if rule.missing_conditions:
-            return check_api.Result(check_api.Conclusion.FAILURE, title, summary)
-        else:
+        if rule.conditions.match:
             return check_api.Result(check_api.Conclusion.SUCCESS, title, summary)
+        else:
+            return check_api.Result(check_api.Conclusion.FAILURE, title, summary)
 
     run = _post
     cancel = _post
